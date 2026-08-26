@@ -65,12 +65,81 @@ body {
   text-align: center;
 }
 
+.security-tools {
+  scroll-margin-top: var(--cf-space-6);
+}
+
+.security-grid {
+  display: grid;
+  gap: var(--cf-space-8);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.key-result,
+.signed-result {
+  background: var(--cf-color-surface-subtle);
+  border: 1px solid var(--cf-color-border);
+  border-radius: var(--cf-radius-lg);
+  padding: var(--cf-space-4);
+}
+
+.break-code,
+.mnemonic {
+  font-family: var(--cf-font-mono);
+  overflow-wrap: anywhere;
+}
+
+.mnemonic {
+  line-height: 1.8;
+}
+
+.artifact-details {
+  display: grid;
+  gap: var(--cf-space-3);
+  margin: 0;
+}
+
+.artifact-details > div {
+  display: grid;
+  gap: var(--cf-space-2);
+  grid-template-columns: 6rem minmax(0, 1fr);
+}
+
+.artifact-details dt {
+  color: var(--cf-color-text-muted);
+}
+
+.artifact-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.manual-instructions,
+.details-content {
+  margin-top: var(--cf-space-3);
+}
+
+.action-list {
+  display: grid;
+  gap: var(--cf-space-3);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.action-list > * {
+  justify-content: flex-start;
+}
+
 @media (max-width: 780px) {
   .header-protocol {
     display: none;
   }
 
   .flasher-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .security-grid,
+  .action-list {
     grid-template-columns: 1fr;
   }
 

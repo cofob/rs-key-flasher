@@ -4,6 +4,11 @@ A small Vinext app that installs [RS-Key](https://github.com/TheMaxMur/RS-Key)
 firmware for RP2350 devices through the picoboot WebUSB interface. It checks the release
 SHA-256 before flashing and reads the flash back before reboot.
 
+The opt-in security tools create one in-memory secp256k1 signing key per device,
+export it as SEC1 PEM or a 24-word mnemonic, seal the selected RP2350 UF2, and
+provide WebUSB and manual flashing paths. Private keys and derived signed files
+are never sent to the Worker, KV, or R2.
+
 ## Requirements
 
 - Node.js 24.11 or newer
@@ -51,4 +56,12 @@ through CORS.
 
 Choose the correct 2 MB, 4 MB, 16 MB, or display image. The boot ROM does not
 give this small flasher a reliable flash-size value. Published RS-Key UF2 files
-are also not sealed for a device that enforces secure boot.
+are also not sealed for a device that enforces secure boot. Download and verify
+the private-key backup before writing any secure-boot OTP fuse. Losing that key
+after `SECURE_BOOT_ENABLE` prevents all future firmware updates for the device.
+
+The production wizard reads every relevant OTP row before a write, refuses
+partial or foreign state, and verifies each write. Runtime-only page-58 and
+anti-rollback fuses use the RS-Key rescue CCID applet. If the operating system
+owns the CCID interface, use the exact `rsk` fallback shown in the app and paste
+`rsk status --json` as boot proof.

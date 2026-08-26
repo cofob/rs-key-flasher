@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { flashUf2 } from "../lib/picoboot";
+import { flashUf2, Picoboot } from "../lib/picoboot";
 import type { Uf2Image } from "../lib/uf2";
 
 class FakeUsb {
@@ -58,6 +58,10 @@ class FakeUsb {
       if (this.corruptRead) bytes[0] ^= 1;
       return { status: "ok", data: new DataView(bytes.buffer) };
     }
+    if (length > 1 && this.pending?.id === 0x8c) {
+      const bytes = new Uint8Array(length).fill(0x5a);
+      return { status: "ok", data: new DataView(bytes.buffer) };
+    }
     return { status: "ok", data: new DataView(new ArrayBuffer(0)) };
   }
 }
@@ -87,5 +91,17 @@ describe("picoboot flashing", () => {
     usb.corruptRead = true;
     await expect(flashUf2(usb as unknown as USBDevice, image(), () => {})).rejects.toThrow(/verification failed/);
     expect(usb.commands).not.toContain(0x0a);
+  });
+
+  it("uses RP2350 picoboot OTP read and write commands", async () => {
+    const usb = new FakeUsb();
+    const connection = new Picoboot(usb as unknown as USBDevice);
+    await connection.open();
+    await connection.exclusive(1);
+    expect(await connection.otpRead(0x80, 2, true)).toEqual(new Uint8Array(4).fill(0x5a));
+    await connection.otpWrite(0x80, Uint8Array.of(1, 2, 3, 4), true);
+    await connection.close();
+    expect(usb.commands).toContain(0x8c);
+    expect(usb.commands).toContain(0x0d);
   });
 });

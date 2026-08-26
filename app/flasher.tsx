@@ -26,54 +26,19 @@ import {
   Text,
 } from "@cofob/design-system-react/static";
 import { CheckCircle2, Cpu, Download as DownloadIcon, ShieldCheck, Usb } from "lucide-react";
+import { assetUrl, downloadVerifiedAsset } from "../lib/assets";
 import { flashUf2, hasWebUsb, requestPicobootDevice, type FlashStage } from "../lib/picoboot";
+import { readSecureBootOtpState } from "../lib/otp";
 import {
   firmwareAssets,
   recommendVariant,
   variantLabel,
-  type FirmwareAsset,
   type ReleaseManifest,
 } from "../lib/releases";
 import { parseUf2 } from "../lib/uf2";
+import { SecurityTools } from "./security-tools";
 
 type SelectionMode = "easy" | "manual";
-
-function assetUrl(asset: FirmwareAsset): string {
-  const query = new URLSearchParams({
-    tag: asset.tag,
-    name: asset.name,
-    sha256: asset.sha256,
-    size: String(asset.size),
-  });
-  const base = import.meta.env.VITE_FLASHER_API_BASE || "";
-  return `${base}/api/assets/${asset.id}?${query}`;
-}
-
-function hex(bytes: ArrayBuffer): string {
-  return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-async function download(asset: FirmwareAsset, onProgress: (value: number) => void): Promise<Uint8Array> {
-  const response = await fetch(assetUrl(asset));
-  if (!response.ok || !response.body) {
-    const message = await response.json().catch(() => null) as { error?: string } | null;
-    throw new Error(message?.error || `Firmware download failed with ${response.status}.`);
-  }
-
-  const output = new Uint8Array(asset.size);
-  const reader = response.body.getReader();
-  let offset = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (offset + value.byteLength > output.byteLength) throw new Error("Firmware is larger than release metadata.");
-    output.set(value, offset);
-    offset += value.byteLength;
-    onProgress(offset / asset.size);
-  }
-  if (offset !== asset.size) throw new Error("Firmware size does not match release metadata.");
-  return output;
-}
 
 function flashPercent(stage: FlashStage, completed: number, total: number): number {
   const ratio = total ? completed / total : 0;
@@ -152,6 +117,10 @@ export function Flasher() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [webUsb, setWebUsb] = useState(true);
+  const [rawFlashEpoch, setRawFlashEpoch] = useState(0);
+  const [securityBusy, setSecurityBusy] = useState(false);
+  const operationLock = useRef(false);
+  const operationBusy = busy || securityBusy;
 
   useEffect(() => {
     Promise.resolve().then(() => setWebUsb(hasWebUsb()));
@@ -182,7 +151,8 @@ export function Flasher() {
   const selectedAsset = assets.find((asset) => asset.variant === variant);
 
   function startDownload() {
-    if (!selectedAsset) return;
+    if (!selectedAsset || operationLock.current) return;
+    setRawFlashEpoch((value) => value + 1);
     const link = document.createElement("a");
     link.href = assetUrl(selectedAsset);
     link.download = selectedAsset.name;
@@ -190,9 +160,10 @@ export function Flasher() {
   }
 
   async function startFlash() {
-    if (!selectedAsset || busy) return;
+    if (!selectedAsset || operationLock.current) return;
 
-    const deviceRequest = requestPicobootDevice();
+    operationLock.current = true;
+    setRawFlashEpoch((value) => value + 1);
     setBusy(true);
     setError("");
     setSuccess("");
@@ -200,15 +171,17 @@ export function Flasher() {
     setStatus("Choose the BOOTSEL device…");
 
     try {
-      const device = await deviceRequest;
+      const device = await requestPicobootDevice();
+      setStatus("Checking device security state…");
+      const security = await readSecureBootOtpState(device);
+      if (security.secureBootEnabled) {
+        throw new Error("Secure boot is enabled on this device. Use Security tools and the matching signing key.");
+      }
       setStatus("Downloading firmware…");
-      const bytes = await download(selectedAsset, (value) => setProgress(5 + value * 20));
+      const bytes = await downloadVerifiedAsset(selectedAsset, (value) => setProgress(5 + value * 20));
 
       setStatus("Checking firmware SHA-256…");
       setProgress(27);
-      const digestInput = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-      const digest = hex(await crypto.subtle.digest("SHA-256", digestInput));
-      if (digest !== selectedAsset.sha256) throw new Error("Firmware SHA-256 does not match the GitHub release.");
 
       const image = parseUf2(bytes);
       setProgress(30);
@@ -228,6 +201,7 @@ export function Flasher() {
       setError(message);
     } finally {
       setBusy(false);
+      operationLock.current = false;
     }
   }
 
@@ -279,7 +253,7 @@ export function Flasher() {
                     <Select
                       label="Release"
                       value={release?.tag || ""}
-                      disabled={!visibleReleases.length || busy}
+                      disabled={!visibleReleases.length || operationBusy}
                       onChange={(event) => setReleaseTag(event.target.value)}
                     >
                       {!visibleReleases.length && <option value="">Loading releases…</option>}
@@ -292,7 +266,7 @@ export function Flasher() {
                     <Switch
                       label="Show prereleases"
                       checked={showPrereleases}
-                      disabled={busy}
+                      disabled={operationBusy}
                       onChange={(event) => setShowPrereleases(event.target.checked)}
                     />
                   </Stack>
@@ -303,7 +277,7 @@ export function Flasher() {
                       name="selection-mode"
                       label="Selection mode"
                       orientation="horizontal"
-                      disabled={busy}
+                      disabled={operationBusy}
                     >
                       <Radio
                         name="selection-mode"
@@ -329,7 +303,7 @@ export function Flasher() {
                           label="Waveshare RP2350-Touch-LCD-2.8 display"
                           description="Select this for the 2.8-inch touch-display board. It uses the 16 MB display image."
                           checked={display}
-                          disabled={busy}
+                          disabled={operationBusy}
                           onChange={(event) => {
                             setDisplay(event.target.checked);
                             if (event.target.checked) setFlashSize("16");
@@ -339,7 +313,7 @@ export function Flasher() {
                           label="Flash memory"
                           hint={display ? "The Waveshare display board uses 16 MB." : "Check the board product page if you are not sure."}
                           value={flashSize}
-                          disabled={display || busy}
+                          disabled={display || operationBusy}
                           onChange={(event) => setFlashSize(event.target.value)}
                         >
                           <option value="2">2 MB</option>
@@ -351,7 +325,7 @@ export function Flasher() {
                       <Select
                         label="Firmware variant"
                         value={effectiveManualVariant}
-                        disabled={!assets.length || busy}
+                        disabled={!assets.length || operationBusy}
                         onChange={(event) => setManualVariant(event.target.value)}
                       >
                         {assets.map((asset) => (
@@ -396,7 +370,7 @@ export function Flasher() {
                         startIcon={Usb}
                         size="lg"
                         loading={busy}
-                        disabled={!webUsb || !selectedAsset || busy}
+                        disabled={!webUsb || !selectedAsset || operationBusy}
                         onClick={startFlash}
                       >
                         {busy ? "Flashing…" : "Connect and flash"}
@@ -405,10 +379,10 @@ export function Flasher() {
                         startIcon={DownloadIcon}
                         size="lg"
                         variant="secondary"
-                        disabled={!selectedAsset || busy}
+                        disabled={!selectedAsset || operationBusy}
                         onClick={startDownload}
                       >
-                        Download
+                        Download original UF2
                       </Button>
                     </Inline>
 
@@ -421,6 +395,15 @@ export function Flasher() {
                 </Card>
               </Stack>
             </div>
+
+            <SecurityTools
+              asset={selectedAsset}
+              webUsb={webUsb}
+              rawFlashEpoch={rawFlashEpoch}
+              externalBusy={busy}
+              operationLockRef={operationLock}
+              onBusyChange={setSecurityBusy}
+            />
 
             <Text as="div" size="sm" tone="subtle" className="site-footer">
               Firmware by <Link href="https://github.com/TheMaxMur/RS-Key" external>RS-Key</Link>

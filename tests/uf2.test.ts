@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { eraseRanges, parseUf2 } from "../lib/uf2";
+import { encodeUf2, eraseRanges, parseUf2 } from "../lib/uf2";
 
 function uf2Block(block: number, count: number, address: number, family = 0xe48bff59): Uint8Array {
   const bytes = new Uint8Array(512);
@@ -49,6 +49,15 @@ describe("UF2 parser", () => {
       uf2Block(1, 2, 0x10001000),
     ));
     expect(eraseRanges(image)).toEqual([{ address: 0x10000000, size: 0x2000 }]);
+  });
+
+  it("encodes a parsed image without changing its flash bytes", () => {
+    const source = join(
+      uf2Block(0, 2, 0x10000000),
+      uf2Block(1, 2, 0x10000100),
+    );
+    const parsed = parseUf2(source);
+    expect(parseUf2(encodeUf2(parsed)).segments).toEqual(parsed.segments);
   });
 
   it("rejects corrupt and unsupported images", () => {

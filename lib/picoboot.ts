@@ -11,6 +11,9 @@ const CMD_READ = 0x84;
 const CMD_WRITE = 0x05;
 const CMD_EXIT_XIP = 0x06;
 const CMD_REBOOT2 = 0x0a;
+const CMD_GET_INFO = 0x8b;
+const CMD_OTP_READ = 0x8c;
+const CMD_OTP_WRITE = 0x0d;
 const REBOOT_FLASH_UPDATE = 0x04;
 const CHUNK_SIZE = 4096;
 
@@ -44,7 +47,19 @@ function rangeArgs(address: number, size: number): Uint8Array {
   return args;
 }
 
-class Picoboot {
+function otpArgs(row: number, count: number, ecc: boolean): Uint8Array {
+  if (!Number.isInteger(row) || !Number.isInteger(count) || row < 0 || row > 0xffff || count < 1 || count > 0xffff) {
+    throw new Error("Invalid OTP row range.");
+  }
+  const args = new Uint8Array(5);
+  const view = new DataView(args.buffer);
+  view.setUint16(0, row, true);
+  view.setUint16(2, count, true);
+  view.setUint8(4, ecc ? 1 : 0);
+  return args;
+}
+
+export class Picoboot {
   private interfaceNumber = -1;
   private inEndpoint = -1;
   private outEndpoint = -1;
@@ -186,6 +201,27 @@ class Picoboot {
 
   read(address: number, size: number): Promise<Uint8Array> {
     return this.command(CMD_READ, rangeArgs(address, size), size);
+  }
+
+  getInfo(type: number, params = new Uint32Array(3), size = 256): Promise<Uint8Array> {
+    if (this.device.productId !== RP2350_BOOT_PID) throw new Error("GET_INFO is only available on RP2350.");
+    const args = new Uint8Array(16);
+    const view = new DataView(args.buffer);
+    view.setUint8(0, type);
+    for (let index = 0; index < Math.min(params.length, 3); index++) view.setUint32(4 + index * 4, params[index], true);
+    return this.command(CMD_GET_INFO, args, size);
+  }
+
+  otpRead(row: number, count: number, ecc = false): Promise<Uint8Array> {
+    if (this.device.productId !== RP2350_BOOT_PID) throw new Error("OTP access is only available on RP2350.");
+    return this.command(CMD_OTP_READ, otpArgs(row, count, ecc), count * (ecc ? 2 : 4));
+  }
+
+  otpWrite(row: number, data: Uint8Array, ecc = false): Promise<Uint8Array> {
+    if (this.device.productId !== RP2350_BOOT_PID) throw new Error("OTP access is only available on RP2350.");
+    const rowSize = ecc ? 2 : 4;
+    if (!data.length || data.length % rowSize) throw new Error(`OTP data must use ${rowSize}-byte rows.`);
+    return this.command(CMD_OTP_WRITE, otpArgs(row, data.length / rowSize, ecc), data);
   }
 
   async reboot(): Promise<void> {

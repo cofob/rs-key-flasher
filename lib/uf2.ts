@@ -127,3 +127,38 @@ export function eraseRanges(image: Uf2Image): Array<{ address: number; size: num
   }
   return merged.map(({ address, end }) => ({ address, size: end - address }));
 }
+
+export function contiguousUf2Data(image: Uf2Image): { address: number; data: Uint8Array } {
+  if (image.segments.length !== 1) fail("secure-boot sealing requires one contiguous flash image");
+  return { address: image.segments[0].address, data: image.segments[0].data.slice() };
+}
+
+export function encodeUf2(image: Uf2Image): Uint8Array {
+  const payloadSize = 256;
+  const blocks: Array<{ address: number; data: Uint8Array }> = [];
+  for (const segment of image.segments) {
+    if (segment.address % payloadSize || segment.data.length % payloadSize) {
+      fail("encoded segments must use 256-byte alignment");
+    }
+    for (let offset = 0; offset < segment.data.length; offset += payloadSize) {
+      blocks.push({ address: segment.address + offset, data: segment.data.subarray(offset, offset + payloadSize) });
+    }
+  }
+
+  const result = new Uint8Array(blocks.length * BLOCK_SIZE);
+  const view = new DataView(result.buffer);
+  for (let index = 0; index < blocks.length; index++) {
+    const offset = index * BLOCK_SIZE;
+    view.setUint32(offset, MAGIC_START_0, true);
+    view.setUint32(offset + 4, MAGIC_START_1, true);
+    view.setUint32(offset + 8, FLAG_FAMILY_ID, true);
+    view.setUint32(offset + 12, blocks[index].address, true);
+    view.setUint32(offset + 16, payloadSize, true);
+    view.setUint32(offset + 20, index, true);
+    view.setUint32(offset + 24, blocks.length, true);
+    view.setUint32(offset + 28, image.familyId, true);
+    result.set(blocks[index].data, offset + 32);
+    view.setUint32(offset + 508, MAGIC_END, true);
+  }
+  return result;
+}

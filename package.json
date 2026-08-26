@@ -16,6 +16,8 @@
   "dependencies": {
     "@cofob/design-system-css": "0.5.0",
     "@cofob/design-system-react": "0.5.0",
+    "@noble/curves": "2.3.0",
+    "@scure/bip39": "2.3.0",
     "lucide-react": "^1.34.0",
     "react": "19.2.6",
     "react-dom": "19.2.6"
