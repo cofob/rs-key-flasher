@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "rs-key-flasher",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-05-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "kv_namespaces": [
+    {
+      "binding": "GITHUB_CACHE",
+      "id": "7b290f10eeea4ad2a8653061a9b8c26c"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "RELEASE_ASSETS",
+      "bucket_name": "rs-key-flasher-release-assets"
+    }
+  ],
+  "routes": [
+    { "pattern": "rskey.fob.wtf", "custom_domain": true }
+  ],
+  "triggers": {
+    "crons": ["0 3 * * *"]
+  }
+}
