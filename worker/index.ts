@@ -22,6 +22,8 @@ interface WorkerContext {
   passThroughOnException(): void;
 }
 
+type EdgeCacheStorage = CacheStorage & { default?: Cache };
+
 interface CachedReleases {
   etag?: string;
   refreshedAt: number;
@@ -55,6 +57,51 @@ function json(data: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json; charset=utf-8");
   return new Response(JSON.stringify(data), { ...init, headers });
+}
+
+function defaultEdgeCache(): Cache | undefined {
+  return (globalThis as typeof globalThis & { caches?: EdgeCacheStorage }).caches?.default;
+}
+
+function edgeHit(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("X-RS-Key-Cache", "EDGE-HIT");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function cacheResponse(ctx: WorkerContext, key: Request, response: Response): void {
+  const cache = defaultEdgeCache();
+  if (!cache || !response.ok) return;
+  ctx.waitUntil(cache.put(key, response.clone()).catch(() => undefined));
+}
+
+function releasesCacheKey(request: Request): Request {
+  const url = new URL(request.url);
+  url.search = "";
+  return new Request(url.toString(), { method: "GET" });
+}
+
+function assetCacheKey(
+  request: Request,
+  assetId: number,
+  tag: string,
+  name: string,
+  size: number,
+  sha256: string,
+): Request {
+  const url = new URL(request.url);
+  url.search = new URLSearchParams({
+    tag,
+    name,
+    sha256,
+    size: String(size),
+  }).toString();
+  url.pathname = `/api/assets/${assetId}`;
+  return new Request(url.toString(), { method: "GET" });
 }
 
 function githubHeaders(env: Env, etag?: string): Headers {
@@ -160,7 +207,9 @@ function hashBytes(hex: string): ArrayBuffer {
 
 function assetHeaders(name: string, size: number, cache: string): Headers {
   return new Headers({
+    "Cache-Tag": "rs-key-release-assets",
     "Cache-Control": "public, max-age=31536000, immutable",
+    "Cloudflare-CDN-Cache-Control": "public, max-age=31536000, immutable",
     "Content-Disposition": contentDisposition(name),
     "Content-Length": String(size),
     "Content-Type": "application/octet-stream",
@@ -195,6 +244,10 @@ async function serveAsset(request: Request, env: Env, ctx: WorkerContext, assetI
     return json({ error: "Invalid asset request." }, { status: 400 });
   }
 
+  const edgeKey = assetCacheKey(request, assetId, tag, name, size, sha256);
+  const edgeCached = await defaultEdgeCache()?.match(edgeKey);
+  if (edgeCached) return edgeHit(edgeCached);
+
   const cachedManifest = await readCachedReleases(env);
   if (cachedManifest && !findAsset(cachedManifest.releases, assetId, tag, name, size, sha256)) {
     return json({ error: "Asset is not present in the cached RS-Key release manifest." }, { status: 404 });
@@ -205,13 +258,19 @@ async function serveAsset(request: Request, env: Env, ctx: WorkerContext, assetI
   if (cached && cached.size === size && cached.customMetadata?.sha256 === sha256) {
     const headers = assetHeaders(name, size, "R2-HIT");
     headers.set("ETag", cached.httpEtag);
-    return new Response(cached.body, { headers });
+    const response = new Response(cached.body, { headers });
+    cacheResponse(ctx, edgeKey, response);
+    return response;
   }
 
   try {
     const origin = await fetchAsset(tag, name, size);
     const headers = assetHeaders(name, size, env.RELEASE_ASSETS ? "R2-MISS" : "PROXY");
-    if (!env.RELEASE_ASSETS) return new Response(origin.body, { headers });
+    if (!env.RELEASE_ASSETS) {
+      const response = new Response(origin.body, { headers });
+      cacheResponse(ctx, edgeKey, response);
+      return response;
+    }
 
     const cacheBody = origin.clone().body;
     if (!cacheBody) throw new Error("GitHub asset stream is missing.");
@@ -225,7 +284,9 @@ async function serveAsset(request: Request, env: Env, ctx: WorkerContext, assetI
       customMetadata: { assetId: String(assetId), filename: name, sha256, tag },
     }).then(() => undefined).catch((error: unknown) => console.error("R2 lazy write failed", error));
     ctx.waitUntil(cacheWrite);
-    return new Response(origin.body, { headers });
+    const response = new Response(origin.body, { headers });
+    cacheResponse(ctx, edgeKey, response);
+    return response;
   } catch (error) {
     return json({ error: error instanceof Error ? error.message : "Asset download failed." }, { status: 502 });
   }
@@ -287,14 +348,21 @@ const worker = {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/api/releases") {
+      const edgeKey = releasesCacheKey(request);
+      const edgeCached = await defaultEdgeCache()?.match(edgeKey);
+      if (edgeCached) return edgeHit(edgeCached);
       try {
         const result = await getReleases(env);
-        return json(publicManifest(result), {
+        const response = json(publicManifest(result), {
           headers: {
-            "Cache-Control": "public, max-age=60, stale-while-revalidate=300",
+            "Cache-Tag": "rs-key-releases",
+            "Cache-Control": "public, max-age=60, s-maxage=300, stale-while-revalidate=300",
+            "Cloudflare-CDN-Cache-Control": "public, max-age=300, stale-while-revalidate=3600",
             "X-RS-Key-Cache": result.source,
           },
         });
+        cacheResponse(ctx, edgeKey, response);
+        return response;
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : "GitHub releases are unavailable." }, { status: 502 });
       }

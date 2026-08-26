@@ -20,6 +20,23 @@ class MemoryKv {
   }
 }
 
+class MemoryEdgeCache {
+  values = new Map<string, Response>();
+
+  async match(request: Request) {
+    return this.values.get(request.url)?.clone();
+  }
+
+  async put(request: Request, response: Response) {
+    const body = await response.arrayBuffer();
+    this.values.set(request.url, new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    }));
+  }
+}
+
 function context() {
   const pending: Promise<unknown>[] = [];
   return {
@@ -38,11 +55,87 @@ const asset = {
 
 beforeEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   asset.sha256 = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("firmware"))),
     (byte) => byte.toString(16).padStart(2, "0")).join("");
 });
 
 describe("Worker cache", () => {
+  it("serves release metadata from the Cloudflare edge cache", async () => {
+    const kv = new MemoryKv();
+    kv.values.set("releases:v1", JSON.stringify({
+      refreshedAt: Date.now(),
+      releases: [{ tag: "v1.0.0", name: "v1", publishedAt: "", prerelease: false, assets: [asset] }],
+    }));
+    const edge = new MemoryEdgeCache();
+    vi.stubGlobal("caches", { default: edge });
+
+    const firstContext = context();
+    const first = await worker.fetch(
+      new Request("https://flasher.test/api/releases?ignored=1"),
+      { GITHUB_CACHE: kv } as never,
+      firstContext,
+    );
+    await first.text();
+    await Promise.all(firstContext.pending);
+
+    const second = await worker.fetch(
+      new Request("https://flasher.test/api/releases"),
+      { GITHUB_CACHE: kv } as never,
+      context(),
+    );
+
+    expect(second.headers.get("X-RS-Key-Cache")).toBe("EDGE-HIT");
+    expect(second.headers.get("Cloudflare-CDN-Cache-Control")).toContain("max-age=300");
+    expect(second.headers.get("Cache-Control")).toContain("s-maxage=300");
+    expect(second.headers.get("Cache-Tag")).toBe("rs-key-releases");
+    expect(edge.values).toHaveLength(1);
+  });
+
+  it("serves a verified R2 asset from the Cloudflare edge cache", async () => {
+    const kv = new MemoryKv();
+    kv.values.set("releases:v1", JSON.stringify({
+      refreshedAt: Date.now(),
+      releases: [{ tag: "v1.0.0", name: "v1", publishedAt: "", prerelease: false, assets: [asset] }],
+    }));
+    const edge = new MemoryEdgeCache();
+    vi.stubGlobal("caches", { default: edge });
+    const r2 = {
+      get: vi.fn(async () => ({
+        size: asset.size,
+        customMetadata: { sha256: asset.sha256 },
+        httpEtag: "test-etag",
+        body: new Response("firmware").body,
+      })),
+    };
+    const query = new URLSearchParams({
+      size: String(asset.size),
+      sha256: asset.sha256,
+      name: asset.name,
+      tag: "v1.0.0",
+    });
+
+    const firstContext = context();
+    const first = await worker.fetch(
+      new Request(`https://flasher.test/api/assets/${asset.id}?${query}`),
+      { GITHUB_CACHE: kv, RELEASE_ASSETS: r2 } as never,
+      firstContext,
+    );
+    expect(await first.text()).toBe("firmware");
+    await Promise.all(firstContext.pending);
+
+    const second = await worker.fetch(
+      new Request(`https://flasher.test/api/assets/${asset.id}?${query}`),
+      { GITHUB_CACHE: kv, RELEASE_ASSETS: r2 } as never,
+      context(),
+    );
+
+    expect(await second.text()).toBe("firmware");
+    expect(second.headers.get("X-RS-Key-Cache")).toBe("EDGE-HIT");
+    expect(second.headers.get("Cache-Tag")).toBe("rs-key-release-assets");
+    expect(r2.get).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps the original filename in the R2 key and response", async () => {
     const kv = new MemoryKv();
     kv.values.set("releases:v1", JSON.stringify({

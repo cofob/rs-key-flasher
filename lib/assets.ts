@@ -1,6 +1,10 @@
 import type { FirmwareAsset } from "./releases";
 
-export function assetUrl(asset: FirmwareAsset): string {
+export function assetUrl(asset: FirmwareAsset, directGitHub = false): string {
+  if (directGitHub) {
+    return asset.downloadUrl
+      || `https://github.com/TheMaxMur/RS-Key/releases/download/${encodeURIComponent(asset.tag)}/${encodeURIComponent(asset.name)}`;
+  }
   const query = new URLSearchParams({
     tag: asset.tag,
     name: asset.name,
@@ -24,8 +28,9 @@ export async function sha256Hex(bytes: Uint8Array): Promise<string> {
 export async function downloadAsset(
   asset: FirmwareAsset,
   onProgress: (value: number) => void = () => {},
+  directGitHub = false,
 ): Promise<Uint8Array> {
-  const response = await fetch(assetUrl(asset));
+  const response = await fetch(assetUrl(asset, directGitHub));
   if (!response.ok || !response.body) {
     const message = await response.json().catch(() => null) as { error?: string } | null;
     throw new Error(message?.error || `Firmware download failed with ${response.status}.`);
@@ -49,8 +54,9 @@ export async function downloadAsset(
 export async function downloadVerifiedAsset(
   asset: FirmwareAsset,
   onProgress?: (value: number) => void,
+  directGitHub = false,
 ): Promise<Uint8Array> {
-  const bytes = await downloadAsset(asset, onProgress);
+  const bytes = await downloadAsset(asset, onProgress, directGitHub);
   if (await sha256Hex(bytes) !== asset.sha256) throw new Error("Firmware SHA-256 does not match the GitHub release.");
   return bytes;
 }

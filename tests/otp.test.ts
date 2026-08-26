@@ -87,6 +87,22 @@ function trustSlotZero(usb: FakeOtpUsb, fingerprint: Uint8Array): void {
 }
 
 describe("secure-boot OTP state", () => {
+  it("accepts the benign non-secure read-only page policy", async () => {
+    const usb = new FakeOtpUsb();
+    usb.setRaw(0xf83, [0x040404]);
+    usb.setRaw(0xf85, [0x040404]);
+
+    const state = await readSecureBootOtpState(usb as unknown as USBDevice);
+
+    expect(state).toMatchObject({
+      page1Lock: 0x040404,
+      page2Lock: 0x040404,
+      pagesLocked: false,
+      consistent: true,
+      problems: [],
+    });
+  });
+
   it("rejects partial CRIT1 RBIT-8 state", async () => {
     const usb = new FakeOtpUsb();
     usb.setRaw(0x40, [1, 0, 0, 0, 0, 0, 0, 0]);

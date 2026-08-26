@@ -11,7 +11,9 @@ const BOOTKEY0_ROW = 0x80;
 const BOOTKEY_STRIDE = 0x10;
 const PAGE1_LOCK_ROW = 0xf83;
 const PAGE2_LOCK_ROW = 0xf85;
+const PAGE_LOCK_NS_RO = 0x040404;
 const PAGE_LOCK_BL_RO = 0x141414;
+const PAGE_LOCK_BL_MASK = 0x303030;
 const ROLLBACK_REQUIRED_BIT = 1 << 11;
 const DEVK_ROW = 0xe80;
 const MKEK_ROW = 0xe90;
@@ -90,6 +92,14 @@ function bitCount(value: number): number {
   return count;
 }
 
+function knownBootPageLock(value: number): boolean {
+  return value === 0 || value === PAGE_LOCK_NS_RO || value === PAGE_LOCK_BL_RO;
+}
+
+function bootloaderPageLocked(value: number): boolean {
+  return Boolean(value & PAGE_LOCK_BL_MASK);
+}
+
 async function withPicoboot<T>(device: USBDevice, action: (connection: Picoboot) => Promise<T>): Promise<T> {
   const connection = new Picoboot(device);
   await connection.open();
@@ -155,9 +165,9 @@ async function readState(connection: Picoboot, serial: string): Promise<SecureBo
   if (!same(flags0Rows)) problems.push("BOOT_FLAGS0 redundant rows differ.");
   if (!same(flags1Rows)) problems.push("BOOT_FLAGS1 redundant rows differ.");
   if (!same(version0Rows) || !same(version1Rows)) problems.push("Rollback-version redundant rows differ.");
-  if (page1Lock !== 0 && page1Lock !== PAGE_LOCK_BL_RO) problems.push("Page 1 has an unknown lock policy.");
-  if (page2Lock !== 0 && page2Lock !== PAGE_LOCK_BL_RO) problems.push("Page 2 has an unknown lock policy.");
-  if ((page1Lock === PAGE_LOCK_BL_RO) !== (page2Lock === PAGE_LOCK_BL_RO)) problems.push("Page 1 and page 2 lock states differ.");
+  if (!knownBootPageLock(page1Lock)) problems.push("Page 1 has an unknown lock policy.");
+  if (!knownBootPageLock(page2Lock)) problems.push("Page 2 has an unknown lock policy.");
+  if (bootloaderPageLocked(page1Lock) !== bootloaderPageLocked(page2Lock)) problems.push("Page 1 and page 2 lock states differ.");
   if (page58Locks[0] !== 0) problems.push("Page 58 LOCK0 is not blank.");
   if (page58Locks[1] !== 0 && page58Locks[1] !== PAGE58_LOCK_VALUE) problems.push("Page 58 has an unknown lock policy.");
   for (let slot = 0; slot < 4; slot++) {
@@ -178,7 +188,7 @@ async function readState(connection: Picoboot, serial: string): Promise<SecureBo
     fingerprints,
     page1Lock,
     page2Lock,
-    pagesLocked: page1Lock === PAGE_LOCK_BL_RO && page2Lock === PAGE_LOCK_BL_RO,
+    pagesLocked: bootloaderPageLocked(page1Lock) && bootloaderPageLocked(page2Lock),
     rollbackRequired: Boolean(flags0 & ROLLBACK_REQUIRED_BIT),
     bootVersion: bitCount(majority(version0Rows)) + bitCount(majority(version1Rows)),
     page58,

@@ -121,6 +121,9 @@ export async function importSecureBootPem(value: string): Promise<SecureBootKey>
 
 export function signSecureBootDigest(digest: Uint8Array, key: SecureBootKey): Uint8Array {
   if (digest.length !== 32) throw new Error("A secure-boot digest must be 32 bytes.");
+  if (!secp256k1.utils.isValidSecretKey(key.privateKey)) {
+    throw new Error("The signing key is unavailable. Re-import its PEM or mnemonic backup.");
+  }
   return secp256k1.sign(digest, key.privateKey, { prehash: false, format: "compact", lowS: true });
 }
 

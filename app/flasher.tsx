@@ -24,21 +24,30 @@ import {
   Stack,
   Switch,
   Text,
+  TextField,
 } from "@cofob/design-system-react/static";
 import { CheckCircle2, Cpu, Download as DownloadIcon, ShieldCheck, Usb } from "lucide-react";
-import { assetUrl, downloadVerifiedAsset } from "../lib/assets";
+import { assetUrl, downloadVerifiedAsset, sha256Hex } from "../lib/assets";
 import { flashUf2, hasWebUsb, requestPicobootDevice, type FlashStage } from "../lib/picoboot";
 import { readSecureBootOtpState } from "../lib/otp";
 import {
   firmwareAssets,
+  firmwareProfiles,
   recommendVariant,
+  releaseManifestFromGitHub,
   variantLabel,
+  type FirmwareAsset,
   type ReleaseManifest,
 } from "../lib/releases";
 import { parseUf2 } from "../lib/uf2";
 import { SecurityTools } from "./security-tools";
 
 type SelectionMode = "easy" | "manual";
+type FirmwareSource = "releases" | "local";
+
+const API_SOURCE_KEY = "rs-key-flasher-api-source";
+const GITHUB_RELEASES_URL = "https://api.github.com/repos/TheMaxMur/RS-Key/releases?per_page=100";
+const MAX_LOCAL_UF2_SIZE = 32 * 1024 * 1024;
 
 function flashPercent(stage: FlashStage, completed: number, total: number): number {
   const ratio = total ? completed / total : 0;
@@ -107,9 +116,15 @@ export function Flasher() {
   const [releaseError, setReleaseError] = useState("");
   const [releaseTag, setReleaseTag] = useState("");
   const [showPrereleases, setShowPrereleases] = useState(false);
+  const [firmwareSource, setFirmwareSource] = useState<FirmwareSource>("releases");
+  const [localAsset, setLocalAsset] = useState<FirmwareAsset | null>(null);
+  const [localBytes, setLocalBytes] = useState<Uint8Array | null>(null);
+  const [localError, setLocalError] = useState("");
+  const [directGitHub, setDirectGitHub] = useState(false);
   const [mode, setMode] = useState<SelectionMode>("easy");
   const [display, setDisplay] = useState(false);
   const [flashSize, setFlashSize] = useState("4");
+  const [profile, setProfile] = useState("default");
   const [manualVariant, setManualVariant] = useState("default");
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -120,14 +135,45 @@ export function Flasher() {
   const [rawFlashEpoch, setRawFlashEpoch] = useState(0);
   const [securityBusy, setSecurityBusy] = useState(false);
   const operationLock = useRef(false);
+  const flashLogRef = useRef("");
   const operationBusy = busy || securityBusy;
 
   useEffect(() => {
-    Promise.resolve().then(() => setWebUsb(hasWebUsb()));
-    fetch(`${import.meta.env.VITE_FLASHER_API_BASE || ""}/api/releases`)
+    if (!busy) return;
+    const percent = Math.round(progress);
+    const signature = `${status}:${percent}`;
+    if (flashLogRef.current === signature) return;
+    flashLogRef.current = signature;
+    console.info(`[RS-Key][flasher] ${status}`, { progress: percent });
+  }, [busy, progress, status]);
+
+  useEffect(() => {
+    if (error) console.error("[RS-Key][flasher] Flash failed", { error });
+  }, [error]);
+
+  useEffect(() => {
+    if (success) console.info("[RS-Key][flasher] Flash completed", { message: success });
+  }, [success]);
+
+  useEffect(() => {
+    const useDirectGitHub = localStorage.getItem(API_SOURCE_KEY) === "github";
+    Promise.resolve().then(() => {
+      setWebUsb(hasWebUsb());
+      setDirectGitHub(useDirectGitHub);
+    });
+    const releasesUrl = useDirectGitHub
+      ? GITHUB_RELEASES_URL
+      : `${import.meta.env.VITE_FLASHER_API_BASE || ""}/api/releases`;
+    fetch(releasesUrl, useDirectGitHub ? { headers: { Accept: "application/vnd.github+json" } } : undefined)
       .then(async (response) => {
-        if (!response.ok) throw new Error((await response.json() as { error?: string }).error || "Could not load releases.");
-        return response.json() as Promise<ReleaseManifest>;
+        const body = await response.json() as unknown;
+        if (!response.ok) {
+          const message = typeof body === "object" && body && "message" in body
+            ? String(body.message)
+            : typeof body === "object" && body && "error" in body ? String(body.error) : "Could not load releases.";
+          throw new Error(message);
+        }
+        return useDirectGitHub ? releaseManifestFromGitHub(body) : body as ReleaseManifest;
       })
       .then((data) => {
         setManifest(data);
@@ -143,25 +189,65 @@ export function Flasher() {
   );
   const release = visibleReleases.find((candidate) => candidate.tag === releaseTag) || visibleReleases[0];
   const assets = useMemo(() => release ? firmwareAssets(release) : [], [release]);
-  const easyVariant = recommendVariant(display, flashSize);
+  const profiles = useMemo(() => firmwareProfiles(assets), [assets]);
+  const effectiveProfile = profiles.includes(profile) ? profile : "default";
+  const easyVariant = recommendVariant(display, flashSize, effectiveProfile);
   const effectiveManualVariant = assets.some((asset) => asset.variant === manualVariant)
     ? manualVariant
     : assets.find((asset) => asset.variant === "default")?.variant || assets[0]?.variant || "";
   const variant = mode === "easy" ? easyVariant : effectiveManualVariant;
-  const selectedAsset = assets.find((asset) => asset.variant === variant);
+  const releaseAsset = assets.find((asset) => asset.variant === variant);
+  const selectedAsset = firmwareSource === "local" ? localAsset || undefined : releaseAsset;
+
+  async function chooseLocalUf2(file?: File): Promise<void> {
+    setLocalAsset(null);
+    setLocalBytes(null);
+    setLocalError("");
+    if (!file) return;
+    try {
+      if (!/\.uf2$/i.test(file.name)) throw new Error("Select a file with the .uf2 extension.");
+      if (!file.size) throw new Error("The selected UF2 file is empty.");
+      if (file.size > MAX_LOCAL_UF2_SIZE) throw new Error("The selected UF2 file is larger than 32 MB.");
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      parseUf2(bytes);
+      const sha256 = await sha256Hex(bytes);
+      setLocalBytes(bytes);
+      setLocalAsset({
+        id: 0,
+        name: file.name,
+        size: bytes.length,
+        sha256,
+        tag: "local",
+        version: "local",
+        variant: "custom",
+      });
+    } catch (reason) {
+      setLocalError(reason instanceof Error ? reason.message : "Could not read the local UF2 file.");
+    }
+  }
+
+  function changeApiSource(useDirectGitHub: boolean): void {
+    localStorage.setItem(API_SOURCE_KEY, useDirectGitHub ? "github" : "proxy");
+    location.reload();
+  }
 
   function startDownload() {
-    if (!selectedAsset || operationLock.current) return;
+    if (!releaseAsset || firmwareSource !== "releases" || operationLock.current) return;
     setRawFlashEpoch((value) => value + 1);
     const link = document.createElement("a");
-    link.href = assetUrl(selectedAsset);
-    link.download = selectedAsset.name;
+    link.href = assetUrl(releaseAsset, directGitHub);
+    link.download = releaseAsset.name;
     link.click();
   }
 
   async function startFlash() {
     if (!selectedAsset || operationLock.current) return;
 
+    flashLogRef.current = "";
+    console.info("[RS-Key][flasher] Flash started", {
+      firmware: selectedAsset.name,
+      source: firmwareSource,
+    });
     operationLock.current = true;
     setRawFlashEpoch((value) => value + 1);
     setBusy(true);
@@ -177,8 +263,11 @@ export function Flasher() {
       if (security.secureBootEnabled) {
         throw new Error("Secure boot is enabled on this device. Use Security tools and the matching signing key.");
       }
-      setStatus("Downloading firmware…");
-      const bytes = await downloadVerifiedAsset(selectedAsset, (value) => setProgress(5 + value * 20));
+      setStatus(firmwareSource === "local" ? "Reading local firmware…" : "Downloading firmware…");
+      const bytes = firmwareSource === "local"
+        ? localBytes?.slice()
+        : await downloadVerifiedAsset(selectedAsset, (value) => setProgress(5 + value * 20));
+      if (!bytes) throw new Error("Select a local UF2 file.");
 
       setStatus("Checking firmware SHA-256…");
       setProgress(27);
@@ -238,8 +327,8 @@ export function Flasher() {
                 Use a current Chromium browser on HTTPS or localhost. This browser cannot access a BOOTSEL device.
               </Alert>
             )}
-            {releaseError && <Alert tone="danger" title="Releases are unavailable">{releaseError}</Alert>}
-            {manifest?.stale && (
+            {releaseError && firmwareSource === "releases" && <Alert tone="danger" title="Releases are unavailable">{releaseError}</Alert>}
+            {manifest?.stale && firmwareSource === "releases" && (
               <Alert tone="warning" title="Using cached release data">
                 GitHub is unavailable. Cached firmware remains available when it is already mirrored.
               </Alert>
@@ -249,29 +338,66 @@ export function Flasher() {
               <Card as="section" padding="lg" variant="elevated">
                 <Stack gap="lg">
                   <Stack gap="md">
-                    <Heading level={2} size="lg">1. Choose a release</Heading>
-                    <Select
-                      label="Release"
-                      value={release?.tag || ""}
-                      disabled={!visibleReleases.length || operationBusy}
-                      onChange={(event) => setReleaseTag(event.target.value)}
-                    >
-                      {!visibleReleases.length && <option value="">Loading releases…</option>}
-                      {visibleReleases.map((item) => (
-                        <option key={item.tag} value={item.tag}>
-                          {item.tag}{item.prerelease ? " · prerelease" : ""}
-                        </option>
-                      ))}
-                    </Select>
-                    <Switch
-                      label="Show prereleases"
-                      checked={showPrereleases}
-                      disabled={operationBusy}
-                      onChange={(event) => setShowPrereleases(event.target.checked)}
-                    />
+                    <Heading level={2} size="lg">1. Choose firmware</Heading>
+                    <RadioGroup name="firmware-source" label="Firmware source" orientation="horizontal" disabled={operationBusy}>
+                      <Radio
+                        name="firmware-source"
+                        value="releases"
+                        label="GitHub release"
+                        description="Choose a published build"
+                        checked={firmwareSource === "releases"}
+                        onChange={() => setFirmwareSource("releases")}
+                      />
+                      <Radio
+                        name="firmware-source"
+                        value="local"
+                        label="Local UF2"
+                        description="Use a file from this computer"
+                        checked={firmwareSource === "local"}
+                        onChange={() => setFirmwareSource("local")}
+                      />
+                    </RadioGroup>
+                    {firmwareSource === "releases" ? (
+                      <>
+                        <Select
+                          label="Release"
+                          value={release?.tag || ""}
+                          disabled={!visibleReleases.length || operationBusy}
+                          onChange={(event) => setReleaseTag(event.target.value)}
+                        >
+                          {!visibleReleases.length && <option value="">Loading releases…</option>}
+                          {visibleReleases.map((item) => (
+                            <option key={item.tag} value={item.tag}>
+                              {item.tag}{item.prerelease ? " · prerelease" : ""}
+                            </option>
+                          ))}
+                        </Select>
+                        <Switch
+                          label="Show prereleases"
+                          checked={showPrereleases}
+                          disabled={operationBusy}
+                          onChange={(event) => setShowPrereleases(event.target.checked)}
+                        />
+                      </>
+                    ) : (
+                      <Stack gap="sm">
+                        <TextField
+                          label="UF2 file"
+                          type="file"
+                          accept=".uf2,application/octet-stream"
+                          disabled={operationBusy}
+                          onChange={(event) => {
+                            void chooseLocalUf2(event.target.files?.[0]);
+                            event.target.value = "";
+                          }}
+                        />
+                        <Text size="sm" tone="muted">The file stays in this browser. Its format and SHA-256 are checked before use.</Text>
+                        {localError && <Alert tone="danger" title="Invalid UF2">{localError}</Alert>}
+                      </Stack>
+                    )}
                   </Stack>
 
-                  <Stack gap="md">
+                  {firmwareSource === "releases" && <Stack gap="md">
                     <Heading level={2} size="lg">2. Choose a device</Heading>
                     <RadioGroup
                       name="selection-mode"
@@ -283,7 +409,7 @@ export function Flasher() {
                         name="selection-mode"
                         value="easy"
                         label="Easy picker"
-                        description="Answer two questions"
+                        description="Answer three questions"
                         checked={mode === "easy"}
                         onChange={() => setMode("easy")}
                       />
@@ -306,7 +432,10 @@ export function Flasher() {
                           disabled={operationBusy}
                           onChange={(event) => {
                             setDisplay(event.target.checked);
-                            if (event.target.checked) setFlashSize("16");
+                            if (event.target.checked) {
+                              setFlashSize("16");
+                              setProfile("default");
+                            }
                           }}
                         />
                         <Select
@@ -314,11 +443,23 @@ export function Flasher() {
                           hint={display ? "The Waveshare display board uses 16 MB." : "Check the board product page if you are not sure."}
                           value={flashSize}
                           disabled={display || operationBusy}
-                          onChange={(event) => setFlashSize(event.target.value)}
+                          onChange={(event) => {
+                            setFlashSize(event.target.value);
+                            if (event.target.value !== "4") setProfile("default");
+                          }}
                         >
                           <option value="2">2 MB</option>
                           <option value="4">4 MB</option>
                           <option value="16">16 MB</option>
+                        </Select>
+                        <Select
+                          label="Firmware profile"
+                          hint={display || flashSize !== "4" ? "Extra policy profiles use the 4 MB layout." : "Choose the security and algorithm policy."}
+                          value={effectiveProfile}
+                          disabled={display || flashSize !== "4" || !profiles.length || operationBusy}
+                          onChange={(event) => setProfile(event.target.value)}
+                        >
+                          {profiles.map((item) => <option key={item} value={item}>{variantLabel(item)}</option>)}
                         </Select>
                       </Stack>
                     ) : (
@@ -333,25 +474,27 @@ export function Flasher() {
                         ))}
                       </Select>
                     )}
-                  </Stack>
+                  </Stack>}
                 </Stack>
               </Card>
 
               <Stack gap="md">
                 <Card as="section" padding="lg" variant="outlined">
                   <Stack gap="md">
-                    <Heading level={2} size="lg">3. Connect and flash</Heading>
+                    <Heading level={2} size="lg">{firmwareSource === "releases" ? "3" : "2"}. Connect and flash</Heading>
                     {selectedAsset ? (
                       <Stack gap="sm" className="recommendation">
                         <Inline gap="sm" align="center">
                           <CheckCircle2 aria-hidden size={19} />
-                          <Text as="span"><strong>{variantLabel(selectedAsset.variant)}</strong></Text>
+                          <Text as="span"><strong>{firmwareSource === "local" ? "Local UF2" : variantLabel(selectedAsset.variant)}</strong></Text>
                         </Inline>
                         <Text size="sm" tone="muted" className="filename">{selectedAsset.name}</Text>
                       </Stack>
                     ) : (
                       <Alert tone="danger" title="No matching image">
-                        This release does not contain the selected variant. Choose another release or use the manual picker.
+                        {firmwareSource === "local"
+                          ? "Choose a valid local UF2 file."
+                          : "This release does not contain the selected variant. Choose another release or use the manual picker."}
                       </Alert>
                     )}
 
@@ -375,15 +518,17 @@ export function Flasher() {
                       >
                         {busy ? "Flashing…" : "Connect and flash"}
                       </Button>
-                      <Button
-                        startIcon={DownloadIcon}
-                        size="lg"
-                        variant="secondary"
-                        disabled={!selectedAsset || operationBusy}
-                        onClick={startDownload}
-                      >
-                        Download original UF2
-                      </Button>
+                      {firmwareSource === "releases" && (
+                        <Button
+                          startIcon={DownloadIcon}
+                          size="lg"
+                          variant="secondary"
+                          disabled={!selectedAsset || operationBusy}
+                          onClick={startDownload}
+                        >
+                          Download original UF2
+                        </Button>
+                      )}
                     </Inline>
 
                     {(busy || progress > 0) && (
@@ -398,6 +543,7 @@ export function Flasher() {
 
             <SecurityTools
               asset={selectedAsset}
+              localFirmware={firmwareSource === "local" ? localBytes || undefined : undefined}
               webUsb={webUsb}
               rawFlashEpoch={rawFlashEpoch}
               externalBusy={busy}
@@ -405,13 +551,23 @@ export function Flasher() {
               onBusyChange={setSecurityBusy}
             />
 
-            <Text as="div" size="sm" tone="subtle" className="site-footer">
-              Firmware by <Link href="https://github.com/TheMaxMur/RS-Key" external>RS-Key</Link>
-              {" · "}
-              Implemented by <Link href="https://cofob.dev/" external>cofob</Link>
-              {" · "}
-              <Link href="https://github.com/cofob/rs-key-flasher" external>Source code</Link>
-            </Text>
+            <footer className="site-footer">
+              <Inline gap="md" justify="center" align="center" wrap>
+                <Text as="span" size="sm" tone="subtle">
+                  Firmware by <Link href="https://github.com/TheMaxMur/RS-Key" external>RS-Key</Link>
+                  {" · "}
+                  Implemented by <Link href="https://cofob.dev/" external>cofob</Link>
+                  {" · "}
+                  <Link href="https://github.com/cofob/rs-key-flasher" external>Source code</Link>
+                </Text>
+                <Switch
+                  className="api-source-switch"
+                  label="Direct GitHub API"
+                  checked={directGitHub}
+                  onChange={(event) => changeApiSource(event.target.checked)}
+                />
+              </Inline>
+            </footer>
           </Stack>
         </Container>
       </main>

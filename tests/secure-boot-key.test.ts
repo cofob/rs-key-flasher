@@ -41,5 +41,6 @@ describe("secure-boot signing keys", () => {
     const key = await generateSecureBootKey();
     clearSecureBootKey(key);
     expect(key.privateKey.every((byte) => byte === 0)).toBe(true);
+    expect(() => signSecureBootDigest(new Uint8Array(32), key)).toThrow(/Re-import/);
   });
 });

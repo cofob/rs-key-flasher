@@ -1,13 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState, type MutableRefObject } from "react";
+import { useEffect, useRef, useState, type MutableRefObject, type ReactNode } from "react";
 import {
   Alert,
   Button,
   Card,
-  Checkbox,
   Heading,
   Inline,
+  Link,
   Progress,
   Stack,
   Switch,
@@ -16,14 +16,13 @@ import {
   TextField,
 } from "@cofob/design-system-react/static";
 import { Copy, Download, KeyRound, ShieldCheck, Usb } from "lucide-react";
+import { Dialog, useToast } from "@cofob/design-system-react/client";
 import { downloadVerifiedAsset, sha256Hex } from "../lib/assets";
 import {
-  Ccid,
   parseRskStatusJson,
-  readRuntimeSecureBootStatus,
-  requestRuntimeDevice,
-  type RuntimeSecureBootStatus,
-} from "../lib/ccid";
+  type RskSecureBootStatus,
+} from "../lib/rsk-status";
+import { rp2350SerialsMatch } from "../lib/device-serial";
 import {
   burnPage58Secrets,
   enableSecureBoot,
@@ -56,11 +55,47 @@ interface SignedResult extends SealedUf2 {
 
 interface SecurityToolsProps {
   asset?: FirmwareAsset;
+  localFirmware?: Uint8Array;
   webUsb: boolean;
   rawFlashEpoch: number;
   externalBusy: boolean;
   operationLockRef: MutableRefObject<boolean>;
   onBusyChange: (busy: boolean) => void;
+}
+
+interface ProvisioningStepProps {
+  number: number;
+  title: string;
+  mode: "BOOTSEL" | "running firmware";
+  state: "complete" | "ready" | "attention";
+  description: string;
+  children: ReactNode;
+}
+
+interface PendingConfirmation {
+  token: string;
+  title: string;
+  consequence: string;
+  action: () => void;
+}
+
+function ProvisioningStep({ number, title, mode, state, description, children }: ProvisioningStepProps) {
+  const stateLabel = state === "complete" ? "Complete" : state === "ready" ? "Ready" : "Check requirements";
+  return (
+    <Card as="section" padding="md" variant="outlined" className="provisioning-step" data-state={state}>
+      <Stack gap="md">
+        <Inline justify="between" align="start" gap="md" wrap>
+          <Stack gap="sm">
+            <Text as="span" size="sm" tone="muted">Step {number} · {mode}</Text>
+            <Heading level={4} size="md">{title}</Heading>
+          </Stack>
+          <span className="provisioning-step__state" data-state={state}>{stateLabel}</span>
+        </Inline>
+        <Text size="sm" tone="muted">{description}</Text>
+        {children}
+      </Stack>
+    </Card>
+  );
 }
 
 const STAGE_LABELS: Record<FlashStage, string> = {
@@ -71,6 +106,20 @@ const STAGE_LABELS: Record<FlashStage, string> = {
   reboot: "Rebooting RS-Key…",
 };
 
+const SECURITY_TOAST_ID = "security-operation";
+const RS_KEY_DOCS = {
+  threatModel: "https://themaxmur.github.io/RS-Key/threat-model.html",
+  production: "https://themaxmur.github.io/RS-Key/production.html",
+  signingKeys: "https://themaxmur.github.io/RS-Key/signing-keys.html",
+  otpFuses: "https://themaxmur.github.io/RS-Key/otp-fuses.html",
+  antiRollback: "https://themaxmur.github.io/RS-Key/anti-rollback.html",
+} as const;
+const RSK_COMMANDS = {
+  status: "uvx --from ./tools rsk status --json",
+  lockPage58: "uvx --from ./tools rsk otp lock-page58",
+  requireRollback: "uvx --from ./tools rsk otp rollback-require",
+} as const;
+
 function flashPercent(stage: FlashStage, completed: number, total: number): number {
   const ratio = total ? completed / total : 0;
   if (stage === "connect") return ratio * 5;
@@ -80,15 +129,8 @@ function flashPercent(stage: FlashStage, completed: number, total: number): numb
   return 95 + ratio * 5;
 }
 
-function normalizeSerial(value: string): string {
-  const normalized = value.toLowerCase().replace(/[^0-9a-f]/g, "");
-  return normalized.length >= 16 ? normalized.slice(-16) : "";
-}
-
 function serialsMatch(left: string, right: string): boolean {
-  const a = normalizeSerial(left);
-  const b = normalizeSerial(right);
-  return Boolean(a && b && a === b);
+  return rp2350SerialsMatch(left, right);
 }
 
 function downloadBlob(name: string, contents: BlobPart, type: string): void {
@@ -115,41 +157,88 @@ function stateSummary(state: SecureBootOtpState): string {
   return `serial ${state.serial} · secure boot ${state.secureBootEnabled ? "enabled" : "off"} · trusted slots ${trusted} · rollback ${state.rollbackRequired ? "required" : "optional"} ${state.bootVersion}/48 · page 58 ${state.page58}`;
 }
 
-export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, operationLockRef, onBusyChange }: SecurityToolsProps) {
+export function SecurityTools({ asset, localFirmware, webUsb, rawFlashEpoch, externalBusy, operationLockRef, onBusyChange }: SecurityToolsProps) {
+  const { toast, dismiss } = useToast();
+  const operationNameRef = useRef("Security operation");
+  const stageLogRef = useRef("");
   const [enabled, setEnabled] = useState(false);
   const [key, setKey] = useState<SecureBootKey | null>(null);
   const [keyInput, setKeyInput] = useState("");
-  const [keyInputSource, setKeyInputSource] = useState<"file" | "paste" | null>(null);
-  const [backupExported, setBackupExported] = useState(false);
-  const [backupVerified, setBackupVerified] = useState(false);
-  const [useRollback, setUseRollback] = useState(false);
+  const [useRollback, setUseRollback] = useState(true);
   const [rollbackVersion, setRollbackVersion] = useState("1");
-  const [raiseRollback, setRaiseRollback] = useState(false);
-  const [rollbackConfirmation, setRollbackConfirmation] = useState("");
   const [signedResult, setSignedResult] = useState<SignedResult | null>(null);
   const [busy, setBusy] = useState(false);
+  const [activeOperation, setActiveOperation] = useState("");
   const [status, setStatus] = useState("Ready");
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [otp, setOtp] = useState<SecureBootOtpState | null>(null);
   const [boundSerial, setBoundSerial] = useState("");
-  const [runtimeProof, setRuntimeProof] = useState<RuntimeSecureBootStatus | null>(null);
-  const [proofContext, setProofContext] = useState("");
-  const [bootCandidateContext, setBootCandidateContext] = useState("");
-  const [bootCandidateSerial, setBootCandidateSerial] = useState("");
+  const [cliStatus, setCliStatus] = useState<RskSecureBootStatus | null>(null);
   const [cliJson, setCliJson] = useState("");
-  const [showProvisioning, setShowProvisioning] = useState(false);
   const [confirmation, setConfirmation] = useState("");
+  const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const [negativeTestStartedContext, setNegativeTestStartedContext] = useState("");
   const [negativeTestPassedContext, setNegativeTestPassedContext] = useState("");
   const [rollbackTestStartedContext, setRollbackTestStartedContext] = useState("");
   const [rollbackTestPassedContext, setRollbackTestPassedContext] = useState("");
   const operationBusy = busy || externalBusy;
 
-  useEffect(() => () => { if (key) clearSecureBootKey(key); }, [key]);
+  useEffect(() => {
+    if (!busy) return;
+    const percent = Math.round(progress);
+    const signature = `${operationNameRef.current}:${status}:${percent}`;
+    if (stageLogRef.current === signature) return;
+    stageLogRef.current = signature;
+    console.info(`[RS-Key][security] ${operationNameRef.current}: ${status}`, { progress: percent });
+  }, [busy, progress, status]);
 
-  const signingContext = `${asset?.id || "none"}:${key?.fingerprint || "none"}:${useRollback ? `${rollbackVersion}:${otp?.serial || "uninspected"}:${otp?.bootVersion ?? "unknown"}` : "none"}`;
+  useEffect(() => {
+    if (error) console.error(`[RS-Key][security] ${operationNameRef.current}: failed`, { error });
+  }, [error]);
+
+  useEffect(() => {
+    if (success) console.info(`[RS-Key][security] ${operationNameRef.current}: completed`, { message: success });
+  }, [success]);
+
+  useEffect(() => {
+    if (error) {
+      toast({
+        id: SECURITY_TOAST_ID,
+        title: "Security operation stopped",
+        description: error,
+        tone: "danger",
+        duration: 8000,
+      });
+      return;
+    }
+    if (success) {
+      toast({
+        id: SECURITY_TOAST_ID,
+        title: "Security operation complete",
+        description: success,
+        tone: "success",
+      });
+      return;
+    }
+    if (busy || progress > 0) {
+      toast({
+        id: SECURITY_TOAST_ID,
+        title: status,
+        description: <Progress value={progress} max={100} label={status} showValue animated={busy} />,
+        tone: "info",
+        duration: 0,
+      });
+    }
+  }, [busy, error, progress, status, success, toast]);
+
+  useEffect(() => () => dismiss(SECURITY_TOAST_ID), [dismiss]);
+
+  // A signed image is determined by its firmware bytes, signer and declared
+  // rollback version. Device identity and its mutable floor are verified when
+  // the image is flashed, so inspecting OTP must not invalidate the artifact.
+  const signingContext = `${asset?.id ?? "none"}:${asset?.sha256 || "none"}:${key?.fingerprint || "none"}:${useRollback ? rollbackVersion : "none"}`;
   const workflowContext = `${rawFlashEpoch}:${signingContext}`;
   const signed = signedResult?.context === signingContext ? signedResult : null;
   const negativeTestStarted = negativeTestStartedContext === workflowContext;
@@ -160,22 +249,22 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
   const inspectedPage58Present = Boolean(otp?.consistent && otp.page58 === "present" && boundSerial && serialsMatch(otp.serial, boundSerial));
   const inspectedPage58Locked = Boolean(otp?.consistent && otp.page58 === "locked" && boundSerial && serialsMatch(otp.serial, boundSerial));
   const burnToken = inspectedPage58Blank ? `BURN-OTP-PAGE58-${otp!.serial}` : "BURN-OTP-PAGE58-<SERIAL>";
+  const hasTrustedBootKey = Boolean(otp?.trustedSlots.length);
+  const hardened = Boolean(otp?.debugDisabled && otp.glitchDetectorEnabled && otp.glitchSensitivity === 3);
 
-  const proofMatchesDevice = useMemo(
-    () => Boolean(
-      runtimeProof
-      && boundSerial
-      && signed
-      && proofContext === workflowContext
-      && bootCandidateContext === workflowContext
-      && serialsMatch(runtimeProof.serial, boundSerial)
-      && serialsMatch(runtimeProof.serial, bootCandidateSerial),
-    ),
-    [runtimeProof, boundSerial, signed, proofContext, workflowContext, bootCandidateContext, bootCandidateSerial],
-  );
-
-  function beginOperation(): boolean {
-    if (operationLockRef.current) return false;
+  function beginOperation(name: string): boolean {
+    if (operationLockRef.current) {
+      console.warn(`[RS-Key][security] ${name}: skipped because another operation is active`);
+      return false;
+    }
+    operationNameRef.current = name;
+    stageLogRef.current = "";
+    console.info(`[RS-Key][security] ${name}: started`);
+    setError("");
+    setSuccess("");
+    setStatus(`${name}…`);
+    setProgress(0);
+    setActiveOperation(name);
     operationLockRef.current = true;
     setBusy(true);
     onBusyChange(true);
@@ -184,14 +273,13 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
 
   function endOperation(): void {
     setBusy(false);
+    setActiveOperation("");
     onBusyChange(false);
     operationLockRef.current = false;
   }
 
   function acceptOtpState(state: SecureBootOtpState): void {
     setOtp(state);
-    setRaiseRollback(false);
-    setRollbackConfirmation("");
     if (state.rollbackRequired) {
       setUseRollback(true);
       setRollbackVersion(String(Math.max(1, state.bootVersion)));
@@ -202,18 +290,13 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
     if (key) clearSecureBootKey(key);
     setKey(next);
     setSignedResult(null);
-    setRuntimeProof(null);
-    setBootCandidateContext("");
-    setBootCandidateSerial("");
-    setBackupExported(false);
-    setBackupVerified(false);
+    setCliStatus(null);
     setKeyInput("");
-    setKeyInputSource(null);
     setError("");
   }
 
   async function generateKey(): Promise<void> {
-    if (!beginOperation()) return;
+    if (!beginOperation("Generate signing key")) return;
     try {
       replaceKey(await generateSecureBootKey());
       setSuccess("A new per-device signing key was generated.");
@@ -226,7 +309,7 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
 
   async function importOrVerifyKey(): Promise<void> {
     if (!keyInput.trim()) return;
-    if (!beginOperation()) return;
+    if (!beginOperation("Import or verify signing key")) return;
     setError("");
     try {
       const imported = await importKey(keyInput);
@@ -235,23 +318,13 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
         throw new Error("This backup belongs to a different signing key.");
       }
       if (key) {
-        if (!backupExported || keyInputSource !== "file") {
-          clearSecureBootKey(imported);
-          throw new Error("Download the PEM or mnemonic, then select that backup file to verify it.");
-        }
         clearSecureBootKey(key);
         setKey(imported);
-        setSignedResult(null);
-        setRuntimeProof(null);
-        setBootCandidateContext("");
-        setBootCandidateSerial("");
-        setBackupVerified(true);
         setKeyInput("");
-        setKeyInputSource(null);
-        setSuccess("The downloaded key backup was verified.");
+        setSuccess("The imported private key matches this session.");
       } else {
         replaceKey(imported);
-        setSuccess("Signing key imported for an update. Export and re-import it before any OTP write.");
+        setSuccess("Signing key imported for an update.");
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Key import failed.");
@@ -263,52 +336,42 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
   async function readKeyFile(file?: File): Promise<void> {
     if (!file) return;
     setKeyInput(await file.text());
-    setKeyInputSource("file");
   }
 
   function exportPem(): void {
     if (!key) return;
     downloadBlob(`rs-key-${key.fingerprint.slice(0, 8)}-secure-boot.pem`, key.pem, "application/x-pem-file");
-    setBackupExported(true);
-    setBackupVerified(false);
     setKeyInput("");
-    setKeyInputSource(null);
   }
 
   function exportMnemonic(): void {
     if (!key) return;
     downloadBlob(`rs-key-${key.fingerprint.slice(0, 8)}-secure-boot.mnemonic.txt`, `${key.mnemonic}\n`, "text/plain");
-    setBackupExported(true);
-    setBackupVerified(false);
     setKeyInput("");
-    setKeyInputSource(null);
   }
 
   async function createSignedUf2(): Promise<void> {
     if (!asset || !key) return;
-    if (!beginOperation()) return;
+    if (!beginOperation("Create signed UF2")) return;
     setError("");
     setSuccess("");
     setProgress(1);
     try {
-      setStatus("Downloading and checking original firmware…");
-      const original = await downloadVerifiedAsset(asset, (value) => setProgress(1 + value * 39));
+      setStatus(localFirmware ? "Checking local firmware…" : "Downloading and checking original firmware…");
+      const original = localFirmware
+        ? localFirmware.slice()
+        : await downloadVerifiedAsset(asset, (value) => setProgress(1 + value * 39));
+      if (original.length !== asset.size || await sha256Hex(original) !== asset.sha256) {
+        throw new Error("The firmware bytes do not match the selected SHA-256 and size.");
+      }
+      if (localFirmware) setProgress(40);
       const version = useRollback ? Number(rollbackVersion) : undefined;
       if (version !== undefined) {
-        if (!otp || !otp.consistent || !boundSerial || !serialsMatch(boundSerial, otp.serial)) {
-          throw new Error("Inspect and bind the target BOOTSEL device before creating a versioned UF2.");
+        if (!Number.isInteger(version) || version < 1 || version > 48) {
+          throw new Error("Rollback version must be an integer from 1 to 48.");
         }
-        if (version < Math.max(1, otp.bootVersion) || version > otp.bootVersion + 1) {
+        if (otp && (version < Math.max(1, otp.bootVersion) || version > otp.bootVersion + 1)) {
           throw new Error(`For this device use rollback version ${Math.max(1, otp.bootVersion)} or ${otp.bootVersion + 1}.`);
-        }
-        if (version === otp.bootVersion + 1) {
-          const token = `RAISE-ROLLBACK-${otp.bootVersion}-TO-${otp.bootVersion + 1}`;
-          if (!raiseRollback || rollbackConfirmation !== token) {
-            throw new Error(`Confirm the one-step rollback-floor increase and type ${token} exactly.`);
-          }
-          if (!backupExported || !backupVerified) {
-            throw new Error("Export and re-import the private-key backup before creating an image that raises the rollback floor.");
-          }
         }
       }
       setStatus("Creating signed picobin image…");
@@ -328,7 +391,7 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
       setSignedResult(result);
       setProgress(100);
       setStatus("Signed UF2 ready");
-      setSuccess(`${filename} was sealed and its signature was verified in this browser.`);
+      setSuccess(`${filename} was sealed and its signature was verified in this browser. Flash it once, then continue down the provisioning steps.`);
     } catch (reason) {
       setStatus("Stopped");
       setError(reason instanceof Error ? reason.message : "UF2 signing failed.");
@@ -340,7 +403,7 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
   function ensureDevice(state: SecureBootOtpState): void {
     if (!state.consistent) throw new Error(state.problems.join(" "));
     if (boundSerial && !serialsMatch(boundSerial, state.serial)) throw new Error("A different RP2350 device was selected.");
-    if (runtimeProof && !serialsMatch(runtimeProof.serial, state.serial)) throw new Error("The boot proof belongs to a different device.");
+    if (cliStatus && !serialsMatch(cliStatus.serial, state.serial)) throw new Error("The rsk status belongs to a different device.");
   }
 
   function ensureTrustedSigner(state: SecureBootOtpState): void {
@@ -357,11 +420,6 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
       if (signed.rollbackVersion < Math.max(1, state.bootVersion) || signed.rollbackVersion > state.bootVersion + 1) {
         throw new Error(`For this device use rollback version ${Math.max(1, state.bootVersion)} or ${Math.min(48, state.bootVersion + 1)}.`);
       }
-      if (signed.rollbackVersion === state.bootVersion + 1) {
-        const token = `RAISE-ROLLBACK-${state.bootVersion}-TO-${state.bootVersion + 1}`;
-        if (!raiseRollback || rollbackConfirmation !== token) throw new Error(`Confirm the one-step rollback-floor increase and type ${token} exactly.`);
-        if (!backupExported || !backupVerified) throw new Error("Export and re-import the private-key backup before raising the rollback floor.");
-      }
     } else if (state.rollbackRequired) {
       throw new Error(`This device requires rollback version ${state.bootVersion} or later.`);
     }
@@ -369,41 +427,11 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
 
   function downloadSignedUf2(): void {
     if (!signed || operationLockRef.current) return;
-    if (signed.rollbackVersion !== undefined && signed.rollbackFloor !== undefined && signed.rollbackVersion === signed.rollbackFloor + 1) {
-      const token = `RAISE-ROLLBACK-${signed.rollbackFloor}-TO-${signed.rollbackVersion}`;
-      if (!raiseRollback || rollbackConfirmation !== token || !backupExported || !backupVerified) {
-        setError(`Re-import the backup and type ${token} before downloading this one-step rollback image.`);
-        return;
-      }
-      setBackupVerified(false);
-      setRaiseRollback(false);
-      setRollbackConfirmation("");
-    }
     downloadBlob(signed.filename, signed.bytes.slice().buffer as ArrayBuffer, "application/octet-stream");
-    setBootCandidateContext(workflowContext);
-    setBootCandidateSerial(boundSerial);
-  }
-
-  function validateRuntimeProof(status: RuntimeSecureBootStatus): void {
-    if (!signed) throw new Error("Create and flash the signed UF2 before obtaining provisioning proof.");
-    if (signed.rollbackVersion !== undefined && status.rollbackVersion !== signed.rollbackVersion) {
-      throw new Error(`The running device rollback version ${status.rollbackVersion} does not match signed UF2 version ${signed.rollbackVersion}.`);
-    }
-    if (signed.rollbackVersion === undefined && status.rollbackRequired) {
-      throw new Error("The running device requires a versioned signed UF2.");
-    }
-  }
-
-  function acceptBootCandidateSerial(serial: string): boolean {
-    if (bootCandidateContext !== workflowContext) return false;
-    if (bootCandidateSerial) return serialsMatch(bootCandidateSerial, serial);
-    if (boundSerial && !serialsMatch(boundSerial, serial)) return false;
-    setBootCandidateSerial(serial);
-    return true;
   }
 
   async function inspectDevice(): Promise<void> {
-    if (!beginOperation()) return;
+    if (!beginOperation("Inspect BOOTSEL OTP")) return;
     setError("");
     try {
       const device = await requestPicobootDevice();
@@ -422,7 +450,7 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
 
   async function flashSigned(): Promise<void> {
     if (!signed || !key) return;
-    if (!beginOperation()) return;
+    if (!beginOperation("Flash signed UF2")) return;
     setError("");
     setSuccess("");
     setProgress(1);
@@ -433,9 +461,7 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
       validateSignedArtifact(state);
       const raisesFloor = signed.rollbackVersion !== undefined && signed.rollbackVersion === state.bootVersion + 1;
       if (raisesFloor) {
-        setBackupVerified(false);
-        setRaiseRollback(false);
-        setRollbackConfirmation("");
+        console.info(`[RS-Key][security] Flash signed UF2: rollback floor will advance from ${state.bootVersion} to ${signed.rollbackVersion}`);
       }
       setBoundSerial(state.serial);
       acceptOtpState(state);
@@ -443,13 +469,10 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
         setStatus(STAGE_LABELS[stage]);
         setProgress(flashPercent(stage, completed, total));
       });
-      setBootCandidateContext(workflowContext);
-      setBootCandidateSerial(state.serial);
-      setRuntimeProof(null);
-      setProofContext("");
+      setCliStatus(null);
       setStatus("Signed flash verified");
       setProgress(100);
-      setSuccess("The signed image was written, read back, verified, and started. Obtain runtime boot proof before any OTP action.");
+      setSuccess("The signed image was written, read back, verified, and started. Continue to BOOTSEL inspection and provisioning.");
     } catch (reason) {
       setStatus("Stopped");
       setError(reason instanceof Error ? reason.message : "Signed flashing failed.");
@@ -458,66 +481,84 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
     }
   }
 
-  async function obtainRuntimeProof(): Promise<void> {
-    if (!beginOperation()) return;
-    setError("");
-    try {
-      const status = await readRuntimeSecureBootStatus(await requestRuntimeDevice());
-      if (boundSerial && !serialsMatch(boundSerial, status.serial)) throw new Error("The runtime device is not the RP2350 bound to this session.");
-      setBoundSerial((current) => current || status.serial);
-      setRuntimeProof(status);
-      if (!acceptBootCandidateSerial(status.serial)) {
-        setProofContext("");
-        throw new Error("Flash the current signed UF2, or download it for manual flashing, before obtaining provisioning proof.");
-      }
-      validateRuntimeProof(status);
-      setProofContext(workflowContext);
-      setSuccess(`Runtime boot proven for device ${status.serial}.`);
-    } catch (reason) {
-      setError(`${reason instanceof Error ? reason.message : "Runtime proof failed."} Use the rsk CLI fallback below.`);
-    } finally {
-      endOperation();
-    }
-  }
-
-  function validateCliProof(): void {
+  function validateCliStatus(): void {
+    operationNameRef.current = "Read rsk CLI status";
+    console.info("[RS-Key][security] Read rsk CLI status: started");
     try {
       const proof = parseRskStatusJson(cliJson);
       if (boundSerial && !serialsMatch(boundSerial, proof.serial)) throw new Error("The CLI status belongs to a different device.");
       setBoundSerial((current) => current || proof.serial);
-      setRuntimeProof(proof);
-      if (!acceptBootCandidateSerial(proof.serial)) {
-        setProofContext("");
-        throw new Error("Flash the current signed UF2, or download it for manual flashing, before validating provisioning proof.");
-      }
-      validateRuntimeProof(proof);
-      setProofContext(workflowContext);
+      setCliStatus(proof);
       setError("");
-      setSuccess(`CLI boot proof accepted for device ${proof.serial}.`);
+      setSuccess(`rsk status accepted for device ${proof.serial}.`);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "CLI proof validation failed.");
+      setError(reason instanceof Error ? reason.message : "Could not read the rsk status output.");
+    }
+  }
+
+  async function copyCliCommand(command: string, label: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(command);
+      console.info(`[RS-Key][security] ${label}: CLI command copied`);
+      toast({
+        title: "rsk command copied",
+        description: label,
+        tone: "success",
+      });
+    } catch {
+      toast({
+        title: "Could not copy the command",
+        description: "Select the command and copy it manually.",
+        tone: "danger",
+      });
+    }
+  }
+
+  function requestIrreversibleAction(confirmationRequest: PendingConfirmation): void {
+    console.info(`[RS-Key][security] ${confirmationRequest.token}: confirmation requested`);
+    setConfirmation("");
+    setPendingConfirmation(confirmationRequest);
+  }
+
+  function closeConfirmation(): void {
+    setPendingConfirmation(null);
+    setConfirmation("");
+  }
+
+  function confirmIrreversibleAction(): void {
+    if (!pendingConfirmation || confirmation !== pendingConfirmation.token) return;
+    const { token, action } = pendingConfirmation;
+    console.info(`[RS-Key][security] ${token}: confirmation accepted`);
+    closeConfirmation();
+    action();
+  }
+
+  async function copyConfirmationToken(): Promise<void> {
+    if (!pendingConfirmation) return;
+    try {
+      await navigator.clipboard.writeText(pendingConfirmation.token);
+      console.info(`[RS-Key][security] ${pendingConfirmation.token}: confirmation token copied`);
+      toast({
+        title: "Confirmation token copied",
+        description: "Paste the token into the field to enable the permanent action.",
+        tone: "success",
+      });
+    } catch {
+      toast({
+        title: "Could not copy the token",
+        description: "Select the token and copy it manually.",
+        tone: "danger",
+      });
     }
   }
 
   async function runOtpAction(
     token: string,
     action: (device: USBDevice) => Promise<SecureBootOtpState | { state: SecureBootOtpState }>,
-    options: { proof?: boolean; backup?: boolean; signedImage?: boolean; negativeTest?: boolean; page58?: "blank" | "present" | "locked" } = {},
+    options: { signedImage?: boolean; negativeTest?: boolean; bootAfter?: boolean; page58?: "blank" | "present" | "locked" } = {},
   ): Promise<void> {
     if (options.page58 && (!otp || !otp.consistent || otp.page58 !== options.page58 || !serialsMatch(otp.serial, boundSerial))) {
       setError(`Inspect and bind the target BOOTSEL device with page 58 ${options.page58} before this action.`);
-      return;
-    }
-    if (confirmation !== token) {
-      setError(`Type ${token} exactly before this irreversible action.`);
-      return;
-    }
-    if (options.proof && !proofMatchesDevice) {
-      setError("A matching runtime boot proof is required before this action.");
-      return;
-    }
-    if (options.backup && (!backupExported || !backupVerified)) {
-      setError("Export and re-import the private-key backup before this action.");
       return;
     }
     if (options.signedImage && !signed) {
@@ -528,7 +569,7 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
       setError("Complete the unsigned-image rejection test before the full lock.");
       return;
     }
-    if (!beginOperation()) return;
+    if (!beginOperation(token)) return;
     setError("");
     setSuccess("");
     try {
@@ -540,14 +581,13 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
         throw new Error(`Page 58 must be ${options.page58} before this action; it is ${before.page58}.`);
       }
       setBoundSerial(before.serial);
-      if (options.backup) setBackupVerified(false);
-      setConfirmation("");
       const result = await action(device);
       const state = "state" in result ? result.state : result;
       acceptOtpState(state);
-      setRuntimeProof(null);
-      setProofContext("");
-      setSuccess(`${token} completed and verified. Reboot the signed image and obtain a new boot proof.`);
+      setCliStatus(null);
+      setSuccess(options.bootAfter
+        ? `${token} completed and verified. Boot the signed image once before the next rejection test.`
+        : `${token} completed and verified.`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : `${token} failed.`);
     } finally {
@@ -555,109 +595,25 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
     }
   }
 
-  async function runRuntimeFuse(kind: "page58" | "rollback", token: string): Promise<void> {
-    if (confirmation !== token) {
-      setError(`Type ${token} exactly before this irreversible action.`);
-      return;
-    }
-    if (!proofMatchesDevice) {
-      setError("A matching runtime boot proof is required before this action.");
-      return;
-    }
-    if (!backupExported || !backupVerified) {
-      setError("Export and re-import the private-key backup before this action.");
-      return;
-    }
-    if (kind === "page58" && (!otp || !otp.consistent || otp.page58 !== "present" || !serialsMatch(otp.serial, boundSerial))) {
-      setError("Inspect the same BOOTSEL device and verify its complete page-58 key and chaff layout before locking it.");
-      return;
-    }
-    if (!beginOperation()) return;
-    setError("");
-    try {
-      const device = await requestRuntimeDevice();
-      const connection = new Ccid(device);
-      await connection.open();
-      try {
-        const status = await connection.readRuntimeStatus();
-        if (!serialsMatch(boundSerial, status.serial)) throw new Error("A different runtime device was selected.");
-        validateRuntimeProof(status);
-        if (kind === "rollback") {
-          if (!signed?.rollbackVersion || status.rollbackVersion !== signed.rollbackVersion) {
-            throw new Error("Boot the versioned signed image before setting ROLLBACK_REQUIRED.");
-          }
-          setBackupVerified(false);
-          setConfirmation("");
-          await connection.requireRollback();
-          const verified = await connection.readRuntimeStatus();
-          if (!verified.rollbackRequired) throw new Error("ROLLBACK_REQUIRED did not verify after the runtime write.");
-        } else {
-          setBackupVerified(false);
-          setConfirmation("");
-          await connection.lockPage58();
-        }
-      } finally {
-        await connection.close();
-      }
-      setOtp(null);
-      setRuntimeProof(null);
-      setProofContext("");
-      setSuccess(`${token} completed. Reconnect in BOOTSEL and inspect OTP to verify the new state.`);
-    } catch (reason) {
-      setError(`${reason instanceof Error ? reason.message : `${token} failed.`} CLI fallback: ${kind === "page58" ? "rsk otp lock-page58" : "rsk otp rollback-require"}`);
-    } finally {
-      endOperation();
-    }
-  }
-
-  async function rebootRuntime(bootsel: boolean): Promise<void> {
-    if (!beginOperation()) return;
-    setError("");
-    setSuccess("");
-    try {
-      const device = await requestRuntimeDevice();
-      const connection = new Ccid(device);
-      await connection.open();
-      try {
-        const runtime = await connection.readRuntimeStatus();
-        if (boundSerial && !serialsMatch(boundSerial, runtime.serial)) throw new Error("A different runtime device was selected.");
-        setBoundSerial((current) => current || runtime.serial);
-        await connection.reboot(bootsel);
-      } finally {
-        await connection.close();
-      }
-      setRuntimeProof(null);
-      setProofContext("");
-      setSuccess(bootsel ? "Reboot to BOOTSEL sent after device confirmation." : "Application reboot sent.");
-    } catch (reason) {
-      setError(`${reason instanceof Error ? reason.message : "Runtime reboot failed."} CLI fallback: rsk reboot ${bootsel ? "bootsel" : "app"}`);
-    } finally {
-      endOperation();
-    }
-  }
-
   async function startNegativeTest(): Promise<void> {
-    if (!signed || !otp?.secureBootEnabled || !proofMatchesDevice) {
-      setError("Enabled secure boot, a signed image, and matching boot proof are required for the rejection test.");
+    if (!signed || !otp?.secureBootEnabled) {
+      setError("A signed image and BOOTSEL confirmation that Secure Boot is enabled are required for the rejection test.");
       return;
     }
-    if (!beginOperation()) return;
+    if (!beginOperation("Unsigned-image rejection test")) return;
     setError("");
     try {
       const device = await requestPicobootDevice();
       const state = await readSecureBootOtpState(device);
       validateSignedArtifact(state);
       if (!state.secureBootEnabled) throw new Error("Secure boot is not enabled.");
-      setBootCandidateContext("");
-      setBootCandidateSerial("");
       await flashUf2(device, parseUf2(signed.original), (stage, completed, total) => {
         setStatus(`Unsigned test: ${STAGE_LABELS[stage]}`);
         setProgress(flashPercent(stage, completed, total));
       });
       setNegativeTestStartedContext(workflowContext);
       setNegativeTestPassedContext("");
-      setRuntimeProof(null);
-      setProofContext("");
+      setCliStatus(null);
       setSuccess("Unsigned image written. A working secure-boot device must return to BOOTSEL. Use Restore signed image next.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Unsigned rejection test failed.");
@@ -667,8 +623,15 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
   }
 
   async function restoreAfterNegativeTest(): Promise<void> {
-    if (!negativeTestStarted || !signed) return;
-    if (!beginOperation()) return;
+    if (!negativeTestStarted) {
+      setError("Run the unsigned-image rejection test before restoring the signed image.");
+      return;
+    }
+    if (!signed) {
+      setError("Create the signed UF2 before restoring it.");
+      return;
+    }
+    if (!beginOperation("Restore signed image")) return;
     setError("");
     try {
       const device = await requestPicobootDevice();
@@ -679,12 +642,9 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
         setStatus(`Restore: ${STAGE_LABELS[stage]}`);
         setProgress(flashPercent(stage, completed, total));
       });
-      setBootCandidateContext(workflowContext);
-      setBootCandidateSerial(state.serial);
       setNegativeTestPassedContext(workflowContext);
-      setRuntimeProof(null);
-      setProofContext("");
-      setSuccess("The unsigned image was rejected and the signed image was restored. Obtain a new runtime proof before full lock.");
+      setCliStatus(null);
+      setSuccess("The unsigned image was rejected and the signed image was restored. Continue to the final Secure Boot lock.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Signed image restore failed.");
     } finally {
@@ -693,11 +653,19 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
   }
 
   async function startVersionlessRollbackTest(): Promise<void> {
-    if (!signed || !key || !otp?.rollbackRequired || !proofMatchesDevice) {
-      setError("A versioned signed image, enforced anti-rollback, and matching boot proof are required.");
+    if (!key) {
+      setError("Import the Secure Boot signing key before the versionless rejection test.");
       return;
     }
-    if (!beginOperation()) return;
+    if (!signed || signed.rollbackVersion === undefined) {
+      setError("Create the versioned signed UF2 before the versionless rejection test.");
+      return;
+    }
+    if (!otp?.rollbackRequired) {
+      setError("Inspect BOOTSEL OTP and confirm that ROLLBACK_REQUIRED is set before the versionless rejection test.");
+      return;
+    }
+    if (!beginOperation("Versionless-image rejection test")) return;
     setError("");
     try {
       const device = await requestPicobootDevice();
@@ -705,16 +673,13 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
       validateSignedArtifact(state);
       if (!state.rollbackRequired) throw new Error("ROLLBACK_REQUIRED is not set on this device.");
       const versionless = await sealUf2(signed.original, key);
-      setBootCandidateContext("");
-      setBootCandidateSerial("");
       await flashUf2(device, versionless.image, (stage, completed, total) => {
         setStatus(`Versionless test: ${STAGE_LABELS[stage]}`);
         setProgress(flashPercent(stage, completed, total));
       });
       setRollbackTestStartedContext(workflowContext);
       setRollbackTestPassedContext("");
-      setRuntimeProof(null);
-      setProofContext("");
+      setCliStatus(null);
       setSuccess("A signed but versionless image was written. The device must return to BOOTSEL. Restore the versioned image next.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Versionless rejection test failed.");
@@ -724,8 +689,15 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
   }
 
   async function restoreAfterRollbackTest(): Promise<void> {
-    if (!rollbackTestStarted || !signed) return;
-    if (!beginOperation()) return;
+    if (!rollbackTestStarted) {
+      setError("Run the versionless-image rejection test before restoring the versioned image.");
+      return;
+    }
+    if (!signed) {
+      setError("Create the versioned signed UF2 before restoring it.");
+      return;
+    }
+    if (!beginOperation("Restore versioned image")) return;
     setError("");
     try {
       const device = await requestPicobootDevice();
@@ -736,12 +708,9 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
         setStatus(`Versioned restore: ${STAGE_LABELS[stage]}`);
         setProgress(flashPercent(stage, completed, total));
       });
-      setBootCandidateContext(workflowContext);
-      setBootCandidateSerial(state.serial);
       setRollbackTestPassedContext(workflowContext);
-      setRuntimeProof(null);
-      setProofContext("");
-      setSuccess("The versionless image was rejected and the versioned signed image was restored. Obtain a fresh runtime proof.");
+      setCliStatus(null);
+      setSuccess("The versionless image was rejected and the versioned signed image was restored. Provisioning is complete.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Versioned image restore failed.");
     } finally {
@@ -769,17 +738,23 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
           <Stack gap="sm">
             <Heading level={2} size="xl">Security tools</Heading>
             <Text tone="muted">RP2350 secure-boot signing key. This is not an X.509 CA.</Text>
+            <Text size="sm">
+              Before you provision a device, read the RS-Key <Link href={RS_KEY_DOCS.threatModel} external>threat model</Link> to understand what this hardening does and does not protect.
+            </Text>
           </Stack>
           <Switch label="Enabled" checked disabled={operationBusy} onChange={(event) => setEnabled(event.target.checked)} />
         </Inline>
 
-        <Alert tone="warning" title="One key per device">
-          The private key never leaves this browser unless you download it. If you lose it after secure boot is enabled, that device cannot receive another firmware update.
+        <Alert tone="warning" title="Download the private-key backup">
+          Save the SEC1 PEM or 24-word mnemonic before provisioning. The app does not require backup verification, but losing this key after Secure Boot is enabled prevents all future firmware updates.
         </Alert>
 
         <div className="security-grid">
           <Stack gap="md">
             <Heading level={3} size="lg">1. Signing key</Heading>
+            <Text size="sm" tone="muted">
+              Generate a new key or import the key that will sign every future firmware update. Download PEM or mnemonic before you continue. Read the <Link href={RS_KEY_DOCS.signingKeys} external>signing-key lifecycle and backup guide</Link> before you fuse its fingerprint.
+            </Text>
             {!key ? (
               <Button startIcon={KeyRound} disabled={operationBusy} onClick={generateKey}>Generate per-device key</Button>
             ) : (
@@ -814,21 +789,17 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
                 spellCheck={false}
                 onChange={(event) => {
                   setKeyInput(event.target.value);
-                  setKeyInputSource("paste");
                 }}
               />
             )}
             <Button variant="secondary" disabled={!keyInput.trim() || operationBusy} onClick={importOrVerifyKey}>
-              {key ? "Verify backup" : "Import key"}
+              {key ? "Check imported key" : "Import key"}
             </Button>
-            {backupExported && !backupVerified && (
-              <Alert tone="warning" title="Backup not verified">Select the downloaded PEM or mnemonic file to verify it before provisioning OTP.</Alert>
-            )}
-            {backupVerified && <Alert tone="success" title="Backup verified">The exported private key matches this session.</Alert>}
           </Stack>
 
           <Stack gap="md">
             <Heading level={3} size="lg">2. Create signed UF2</Heading>
+            <Text size="sm" tone="muted">Create the recovery image first. The same image is reused throughout provisioning and for every restore test.</Text>
             <Text size="sm" tone="muted">{asset?.name || "Choose a release and variant above."}</Text>
             <Switch
               label="Add anti-rollback version"
@@ -836,10 +807,11 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
               disabled={Boolean(otp?.rollbackRequired)}
               onChange={(event) => {
                 setUseRollback(event.target.checked);
-                setRaiseRollback(false);
-                setRollbackConfirmation("");
               }}
             />
+            <Text size="sm" tone="muted">
+              Leave this enabled for the complete production flow. Version 1 is correct for a new device and avoids recreating the image before steps 9–11. The <Link href={RS_KEY_DOCS.antiRollback} external>anti-rollback guide</Link> explains the version floor and the 48-version lifetime budget.
+            </Text>
             {useRollback && (
               <TextField
                 label="Rollback version"
@@ -849,29 +821,7 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
                 value={rollbackVersion}
                 onChange={(event) => {
                   setRollbackVersion(event.target.value);
-                  setRaiseRollback(false);
-                  setRollbackConfirmation("");
                 }}
-              />
-            )}
-            {useRollback && otp && Number(rollbackVersion) === otp.bootVersion + 1 && (
-              <Checkbox
-                label={`Raise this device rollback floor from ${otp.bootVersion} to ${otp.bootVersion + 1}`}
-                description="This one-way change rejects every older firmware version."
-                checked={raiseRollback}
-                onChange={(event) => {
-                  setRaiseRollback(event.target.checked);
-                  setRollbackConfirmation("");
-                }}
-              />
-            )}
-            {useRollback && otp && Number(rollbackVersion) === otp.bootVersion + 1 && raiseRollback && (
-              <TextField
-                label={`Type RAISE-ROLLBACK-${otp.bootVersion}-TO-${otp.bootVersion + 1}`}
-                value={rollbackConfirmation}
-                spellCheck={false}
-                autoComplete="off"
-                onChange={(event) => setRollbackConfirmation(event.target.value)}
               />
             )}
             <Button
@@ -908,7 +858,7 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
                   <li>Hold BOOTSEL while connecting the device.</li>
                   <li>Copy <code>{signed.filename}</code> to the <code>RPI-RP2</code> drive and wait for it to disconnect.</li>
                   <li>Or run <code>picotool load -v -x &quot;{signed.filename}&quot;</code>.</li>
-                  <li>Return here and obtain runtime boot proof before any OTP action.</li>
+                  <li>Return here, inspect BOOTSEL OTP, and continue down the provisioning steps.</li>
                 </ol>
                 <Alert tone="warning" title="Already sealed">
                   Do not run picotool seal again. The signer must match the device OTP key, and the rollback version must not be below its current floor.
@@ -919,73 +869,280 @@ export function SecurityTools({ asset, webUsb, rawFlashEpoch, externalBusy, oper
         )}
 
         <Stack gap="md">
-          <Heading level={3} size="lg">3. Device state and boot proof</Heading>
-          <Inline gap="sm" wrap>
-            <Button variant="secondary" startIcon={Usb} disabled={!webUsb || operationBusy} onClick={inspectDevice}>Inspect BOOTSEL OTP</Button>
-            <Button variant="secondary" startIcon={ShieldCheck} disabled={!webUsb || operationBusy} onClick={obtainRuntimeProof}>Read runtime proof</Button>
-            <Button variant="secondary" disabled={!webUsb || operationBusy} onClick={() => void rebootRuntime(false)}>Reboot app</Button>
-            <Button variant="secondary" disabled={!webUsb || operationBusy} onClick={() => void rebootRuntime(true)}>Reboot to BOOTSEL</Button>
-          </Inline>
+          <Heading level={3} size="lg">3. Inspect BOOTSEL and check runtime with rsk</Heading>
+          <Text size="sm" tone="muted">The browser is used only for BOOTSEL inspection, OTP writes, and flashing. Use the rsk CLI as the primary way to read a running device and to run firmware-side provisioning commands.</Text>
+          <Button variant="secondary" startIcon={Usb} disabled={!webUsb || operationBusy} onClick={inspectDevice}>Inspect BOOTSEL OTP</Button>
           {otp && (
             <Alert tone={otp.consistent ? "info" : "danger"} title="BOOTSEL OTP state">
               {stateSummary(otp)}{otp.problems.length ? ` · ${otp.problems.join(" ")}` : ""}
             </Alert>
           )}
-          {runtimeProof && (
-            <Alert tone={proofMatchesDevice ? "success" : "danger"} title="Runtime boot proof">
-              {runtimeProof.source} · serial {runtimeProof.serial} · secure boot {runtimeProof.enabled ? "enabled" : "off"} · rollback {runtimeProof.rollbackRequired ? "required" : "optional"} {runtimeProof.rollbackVersion}/{runtimeProof.rollbackCapacity}
+          <Alert tone="info" title="rsk is the runtime interface">
+            Run rsk from the RS-Key repository while the normal firmware is running. You do not normally need to close this tab. If another program holds the smart-card interface, closing the tab can help as a troubleshooting step.
+          </Alert>
+          <Text>Run without installation with <Link href="https://docs.astral.sh/uv/getting-started/installation/" external>uv</Link> and Python 3.10 or later:</Text>
+          <pre className="cli-command"><code>{`git clone https://github.com/TheMaxMur/RS-Key.git
+cd RS-Key
+${RSK_COMMANDS.status}`}</code></pre>
+          <Inline gap="sm" wrap>
+            <Button variant="secondary" startIcon={Copy} onClick={() => void copyCliCommand(RSK_COMMANDS.status, "Runtime status command")}>Copy status command</Button>
+            <Link href="https://github.com/TheMaxMur/RS-Key/blob/main/tools/README.md" external>Open the rsk CLI guide</Link>
+          </Inline>
+          <Text size="sm" tone="muted">For a persistent command, run <code>uv tool install ./tools</code>. On Linux, install PC/SC and start <code>pcscd</code>.</Text>
+          <Textarea label="rsk status --json output" value={cliJson} rows={5} onChange={(event) => setCliJson(event.target.value)} />
+          <Button variant="secondary" disabled={!cliJson.trim() || operationBusy} onClick={validateCliStatus}>Read rsk status</Button>
+          {cliStatus && (
+            <Alert tone="success" title="rsk runtime status">
+              serial {cliStatus.serial} · secure boot {cliStatus.enabled ? "enabled" : "off"} · boot key {cliStatus.bootKeySlot ?? "none"} · rollback {cliStatus.rollbackRequired ? "required" : "optional"} {cliStatus.rollbackVersion}/{cliStatus.rollbackCapacity}
             </Alert>
           )}
-          <details>
-            <summary>rsk CLI fallback</summary>
-            <Stack gap="sm" className="details-content">
-              <Text>Run <code>rsk status --json</code>, then paste its complete output:</Text>
-              <Textarea label="rsk status JSON" value={cliJson} rows={5} onChange={(event) => setCliJson(event.target.value)} />
-              <Button variant="secondary" disabled={!cliJson.trim() || operationBusy} onClick={validateCliProof}>Validate CLI proof</Button>
-              <Text size="sm" tone="muted">Runtime fallbacks: <code>rsk reboot app</code>, <code>rsk reboot bootsel</code>, <code>rsk otp lock-page58</code>, and <code>rsk otp rollback-require</code>. Reconnect in BOOTSEL and inspect OTP after either fuse command.</Text>
-            </Stack>
-          </details>
+          <Alert tone="warning" title="If secure_boot is null">
+            Make sure the normal RS-Key firmware is running, reconnect the device, and run the status command again. If access is still blocked, closing this tab can help, but it is not a normal requirement. Download the signing-key backup first if you choose to close it.
+          </Alert>
         </Stack>
 
-        <Stack gap="md">
-          <Checkbox
-            label="Show irreversible production provisioning"
-            description="Each action writes one-way RP2350 OTP fuses and needs its own exact token."
-            checked={showProvisioning}
-            onChange={(event) => setShowProvisioning(event.target.checked)}
-          />
-          {showProvisioning && (
-            <Card as="section" padding="md" variant="outlined" className="provisioning-actions">
-              <Stack gap="md">
-                <Alert tone="danger" title="Irreversible actions">Use one RP2350 device, one signing key, and follow the stages in order. The app refuses inconsistent or foreign OTP state.</Alert>
-                <TextField
-                  label="Confirmation token"
-                  value={confirmation}
-                  spellCheck={false}
-                  autoComplete="off"
-                  onChange={(event) => setConfirmation(event.target.value)}
-                />
-                <div className="action-list">
-                  <Button variant="secondary" disabled={operationBusy || !key || !inspectedPage58Blank} onClick={() => void runOtpAction(burnToken, burnPage58Secrets, { backup: true, page58: "blank" })}>{burnToken} · create MKEK + DEVK</Button>
-                  <Button variant="secondary" disabled={operationBusy || !inspectedPage58Present || !proofMatchesDevice} onClick={() => void runRuntimeFuse("page58", "LOCK-PAGE58")}>LOCK-PAGE58 · runtime hard lock</Button>
-                  <Button variant="secondary" disabled={operationBusy || !key || !inspectedPage58Locked} onClick={() => key && void runOtpAction("LOAD-BOOTKEY", (device) => loadBootKeyFingerprint(device, key.fingerprint), { proof: true, backup: true, signedImage: true, page58: "locked" })}>LOAD-BOOTKEY · trust this signer</Button>
-                  <Button variant="secondary" disabled={operationBusy || !key} onClick={() => key && void runOtpAction("HARDEN-SECURE-BOOT", (device) => hardenSecureBoot(device, key.fingerprint), { proof: true, backup: true, signedImage: true })}>HARDEN-SECURE-BOOT · disable debug</Button>
-                  <Button variant="secondary" disabled={operationBusy || !key} onClick={() => key && void runOtpAction("ENABLE-SECURE-BOOT", (device) => enableSecureBoot(device, key.fingerprint), { proof: true, backup: true, signedImage: true })}>ENABLE-SECURE-BOOT · enforce signatures</Button>
-                  <Button variant="secondary" disabled={operationBusy} onClick={startNegativeTest}>Flash unsigned rejection test</Button>
-                  <Button variant="secondary" disabled={operationBusy || !negativeTestStarted} onClick={restoreAfterNegativeTest}>Restore signed image after rejection</Button>
-                  <Button variant="secondary" disabled={operationBusy || !key} onClick={() => key && void runOtpAction("LOCK-SECURE-BOOT", (device) => lockSecureBootPages(device, key.fingerprint), { proof: true, backup: true, signedImage: true, negativeTest: true })}>LOCK-SECURE-BOOT · revoke unused slots</Button>
-                  <Button variant="secondary" disabled={operationBusy || !useRollback} onClick={() => void runRuntimeFuse("rollback", "ROLLBACK-REQUIRED")}>ROLLBACK-REQUIRED · reject versionless images</Button>
-                  <Button variant="secondary" disabled={operationBusy || !otp?.rollbackRequired || rollbackTestPassed} onClick={startVersionlessRollbackTest}>Flash versionless rejection test</Button>
-                  <Button variant="secondary" disabled={operationBusy || !rollbackTestStarted} onClick={restoreAfterRollbackTest}>Restore versioned image after rejection</Button>
-                </div>
-              </Stack>
-            </Card>
+        <Stack gap="md" className="provisioning-flow">
+          <Heading level={3} size="lg">4. Irreversible production provisioning</Heading>
+          <Text tone="muted">
+            Continue from top to bottom. Each card tells you whether the device must run the firmware or be connected with BOOTSEL held. Keep the complete RS-Key <Link href={RS_KEY_DOCS.production} external>production setup guide</Link> open as a reference.
+          </Text>
+          <Alert tone="danger" title="Permanent OTP changes">
+            These actions cannot be undone. Browser actions open a confirmation window with the exact token. Runtime actions use the rsk typed confirmation in the terminal. Completed BOOTSEL writes are read back and verified. Read the <Link href={RS_KEY_DOCS.otpFuses} external>RP2350 OTP fuse map</Link> before the first write.
+          </Alert>
+
+          <ProvisioningStep
+            number={1}
+            title="Create the device storage keys"
+            mode="BOOTSEL"
+            state={inspectedPage58Present || inspectedPage58Locked ? "complete" : inspectedPage58Blank && key ? "ready" : "attention"}
+            description="Writes random MKEK and DEVK values to OTP page 58. You do not need to save these values; secure firmware uses them to protect secrets stored in flash."
+          >
+            <Inline gap="sm" wrap>
+              <Button variant="secondary" startIcon={Usb} disabled={!webUsb || operationBusy} onClick={inspectDevice}>Inspect BOOTSEL</Button>
+              <Button
+                variant="secondary"
+                disabled={operationBusy}
+                onClick={() => key ? requestIrreversibleAction({
+                  token: burnToken,
+                  title: "Confirm step 1: Create device storage keys",
+                  consequence: "This permanently writes unique MKEK and DEVK values to OTP page 58. The values cannot be erased or replaced.",
+                  action: () => void runOtpAction(burnToken, burnPage58Secrets, { page58: "blank" }),
+                }) : setError("Generate or import the signing key before provisioning.")}
+              >
+                Run step 1
+              </Button>
+            </Inline>
+          </ProvisioningStep>
+
+          <ProvisioningStep
+            number={2}
+            title="Hide page 58 from BOOTSEL"
+            mode="running firmware"
+            state={inspectedPage58Locked ? "complete" : inspectedPage58Present ? "ready" : "attention"}
+            description="Permanently blocks BOOTSEL and non-secure code from reading MKEK and DEVK. Start the normal firmware and run the rsk command below. The CLI asks for typed confirmation and device presence. Then reconnect in BOOTSEL and select Inspect BOOTSEL in the next card."
+          >
+            <pre className="cli-command"><code>{RSK_COMMANDS.lockPage58}</code></pre>
+            <Button variant="secondary" startIcon={Copy} onClick={() => void copyCliCommand(RSK_COMMANDS.lockPage58, "Step 2: lock OTP page 58")}>
+              Copy step 2 command
+            </Button>
+          </ProvisioningStep>
+
+          <ProvisioningStep
+            number={3}
+            title="Trust this firmware signing key"
+            mode="BOOTSEL"
+            state={hasTrustedBootKey ? "complete" : inspectedPage58Locked && key ? "ready" : "attention"}
+            description="Writes only the SHA-256 fingerprint of the public signing key to OTP. The private key stays in your backup. Signature enforcement is still off after this step."
+          >
+            <Inline gap="sm" wrap>
+              <Button variant="secondary" startIcon={Usb} disabled={!webUsb || operationBusy} onClick={inspectDevice}>Inspect BOOTSEL</Button>
+              <Button
+                variant="secondary"
+                disabled={operationBusy}
+                onClick={() => key ? requestIrreversibleAction({
+                  token: "LOAD-BOOTKEY",
+                  title: "Confirm step 3: Trust the signing key",
+                  consequence: "This permanently stores the public signing-key fingerprint in an OTP key slot. The slot cannot be erased or changed.",
+                  action: () => void runOtpAction("LOAD-BOOTKEY", (device) => loadBootKeyFingerprint(device, key.fingerprint), { page58: "locked" }),
+                }) : setError("Import the Secure Boot signing key before loading its fingerprint.")}
+              >
+                Run step 3
+              </Button>
+            </Inline>
+          </ProvisioningStep>
+
+          <ProvisioningStep
+            number={4}
+            title="Disable hardware debug"
+            mode="BOOTSEL"
+            state={hardened ? "complete" : hasTrustedBootKey && key ? "ready" : "attention"}
+            description="Permanently disables SWD debug and enables the RP2350 glitch detector. This does not enable signature enforcement, so continue directly to step 5 in the same BOOTSEL session."
+          >
+            <Button
+              variant="secondary"
+              disabled={operationBusy}
+              onClick={() => key ? requestIrreversibleAction({
+                token: "HARDEN-SECURE-BOOT",
+                title: "Confirm step 4: Disable hardware debug",
+                consequence: "This permanently disables SWD hardware debug and enables the glitch detector. SWD recovery will no longer be available.",
+                action: () => void runOtpAction("HARDEN-SECURE-BOOT", (device) => hardenSecureBoot(device, key.fingerprint)),
+              }) : setError("Import the Secure Boot signing key before hardening.")}
+            >
+              Run step 4
+            </Button>
+          </ProvisioningStep>
+
+          <ProvisioningStep
+            number={5}
+            title="Enforce signed firmware"
+            mode="BOOTSEL"
+            state={otp?.secureBootEnabled ? "complete" : hardened && signed ? "ready" : "attention"}
+            description="Sets SECURE_BOOT_ENABLE. From this point, the RP2350 rejects firmware that is not signed by the trusted key. Make sure the signed recovery UF2 was created before you continue."
+          >
+            <Button
+              variant="secondary"
+              disabled={operationBusy}
+              onClick={() => key ? requestIrreversibleAction({
+                token: "ENABLE-SECURE-BOOT",
+                title: "Confirm step 5: Enforce signed firmware",
+                consequence: "This permanently enables Secure Boot. The device will reject firmware that is unsigned or signed by a different key.",
+                action: () => void runOtpAction("ENABLE-SECURE-BOOT", (device) => enableSecureBoot(device, key.fingerprint), { signedImage: true, bootAfter: true }),
+              }) : setError("Import the Secure Boot signing key before enabling enforcement.")}
+            >
+              Run step 5
+            </Button>
+          </ProvisioningStep>
+
+          <ProvisioningStep
+            number={6}
+            title="Prove that unsigned firmware is rejected"
+            mode="BOOTSEL"
+            state={negativeTestStarted ? "complete" : otp?.secureBootEnabled && signed ? "ready" : "attention"}
+            description="First boot the signed image once after step 5. Then reconnect with BOOTSEL and run this test. It temporarily writes the original unsigned image; enforced Secure Boot must reject it and return to BOOTSEL. Progress is shown in the active toast and console."
+          >
+            <Button variant="secondary" loading={busy && activeOperation === "Unsigned-image rejection test"} disabled={operationBusy} onClick={startNegativeTest}>Run step 6</Button>
+          </ProvisioningStep>
+
+          <ProvisioningStep
+            number={7}
+            title="Restore the signed firmware"
+            mode="BOOTSEL"
+            state={negativeTestPassed ? "complete" : negativeTestStarted ? "ready" : "attention"}
+            description="Restores the signed recovery image after the unsigned rejection test and verifies every written byte. No new key or signed image is required."
+          >
+            <Button variant="secondary" loading={busy && activeOperation === "Restore signed image"} disabled={operationBusy} onClick={restoreAfterNegativeTest}>Run step 7</Button>
+          </ProvisioningStep>
+
+          <ProvisioningStep
+            number={8}
+            title="Finalize the Secure Boot key policy"
+            mode="BOOTSEL"
+            state={otp?.pagesLocked ? "complete" : negativeTestPassed && key ? "ready" : "attention"}
+            description="Revokes unused boot-key slots and makes OTP pages 1 and 2 read-only to BOOTSEL. Future firmware must use the current signing key; key rotation is no longer possible."
+          >
+            <Button
+              variant="secondary"
+              disabled={operationBusy}
+              onClick={() => key ? requestIrreversibleAction({
+                token: "LOCK-SECURE-BOOT",
+                title: "Confirm step 8: Finalize the Secure Boot key policy",
+                consequence: "This permanently revokes unused key slots and locks OTP pages 1 and 2 against BOOTSEL writes. You cannot rotate the signing key after this action.",
+                action: () => void runOtpAction("LOCK-SECURE-BOOT", (device) => lockSecureBootPages(device, key.fingerprint), { signedImage: true, negativeTest: true }),
+              }) : setError("Import the Secure Boot signing key before the final lock.")}
+            >
+              Run step 8
+            </Button>
+          </ProvisioningStep>
+
+          <ProvisioningStep
+            number={9}
+            title="Require rollback versions"
+            mode="running firmware"
+            state={otp?.rollbackRequired || cliStatus?.rollbackRequired ? "complete" : signed?.rollbackVersion !== undefined ? "ready" : "attention"}
+            description="Permanently rejects signed images that have no rollback version or have a version below the OTP floor. Boot the versioned signed firmware and verify its version with rsk status first. The CLI then applies the fuse with typed confirmation and device presence."
+          >
+            <pre className="cli-command"><code>{RSK_COMMANDS.requireRollback}</code></pre>
+            <Text size="sm">Review the <Link href={RS_KEY_DOCS.antiRollback} external>anti-rollback policy and recovery limits</Link> before you make rollback versions mandatory.</Text>
+            <Text size="sm">After the command succeeds, run <code>{RSK_COMMANDS.status}</code> again and verify that rollback is required. Then reconnect in BOOTSEL for step 10.</Text>
+            <Button variant="secondary" startIcon={Copy} onClick={() => void copyCliCommand(RSK_COMMANDS.requireRollback, "Step 9: require rollback versions")}>
+              Copy step 9 command
+            </Button>
+          </ProvisioningStep>
+
+          <ProvisioningStep
+            number={10}
+            title="Prove that versionless firmware is rejected"
+            mode="BOOTSEL"
+            state={rollbackTestStarted ? "complete" : otp?.rollbackRequired && signed?.rollbackVersion !== undefined && key ? "ready" : "attention"}
+            description="Creates a temporary image signed by the correct key but without a rollback version. The device must reject it and return to BOOTSEL. Progress is shown continuously."
+          >
+            <Inline gap="sm" wrap>
+              <Button variant="secondary" startIcon={Usb} disabled={!webUsb || operationBusy} onClick={inspectDevice}>Inspect BOOTSEL</Button>
+              <Button variant="secondary" loading={busy && activeOperation === "Versionless-image rejection test"} disabled={operationBusy} onClick={startVersionlessRollbackTest}>Run step 10</Button>
+            </Inline>
+          </ProvisioningStep>
+
+          <ProvisioningStep
+            number={11}
+            title="Restore the versioned firmware"
+            mode="BOOTSEL"
+            state={rollbackTestPassed ? "complete" : rollbackTestStarted ? "ready" : "attention"}
+            description="Restores and verifies the working signed image with its rollback version. Provisioning is complete when this step succeeds."
+          >
+            <Button variant="secondary" loading={busy && activeOperation === "Restore versioned image"} disabled={operationBusy} onClick={restoreAfterRollbackTest}>Run step 11</Button>
+          </ProvisioningStep>
+        </Stack>
+
+        <Dialog
+          open={Boolean(pendingConfirmation)}
+          onOpenChange={(open) => {
+            if (!open) closeConfirmation();
+          }}
+          title={pendingConfirmation?.title ?? "Confirm permanent action"}
+          description="Review the result, copy the token, and type it exactly to continue."
+          closeLabel="Close confirmation"
+          footer={(
+            <Inline gap="sm" justify="end" wrap>
+              <Button variant="secondary" onClick={closeConfirmation}>Cancel</Button>
+              <Button
+                variant="danger"
+                disabled={!pendingConfirmation || confirmation !== pendingConfirmation.token}
+                onClick={confirmIrreversibleAction}
+              >
+                Confirm permanent action
+              </Button>
+            </Inline>
           )}
-        </Stack>
+        >
+          {pendingConfirmation && (
+            <Stack gap="md">
+              <Alert tone="danger" title="Permanent result">
+                {pendingConfirmation.consequence} There is no undo.
+              </Alert>
+              <Stack gap="sm">
+                <Text size="sm" tone="muted">Confirmation token</Text>
+                <Inline gap="sm" align="center" wrap>
+                  <code className="confirmation-token">{pendingConfirmation.token}</code>
+                  <Button variant="secondary" startIcon={Copy} onClick={() => void copyConfirmationToken()}>
+                    Copy token
+                  </Button>
+                </Inline>
+              </Stack>
+              <TextField
+                label="Type the confirmation token"
+                value={confirmation}
+                spellCheck={false}
+                autoComplete="off"
+                error={confirmation && confirmation !== pendingConfirmation.token ? "The token does not match." : undefined}
+                onChange={(event) => setConfirmation(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && confirmation === pendingConfirmation.token) confirmIrreversibleAction();
+                }}
+              />
+            </Stack>
+          )}
+        </Dialog>
 
-        {(busy || progress > 0) && <Progress value={progress} max={100} label={status} showValue animated={busy} />}
-        {error && <Alert tone="danger" title="Security operation stopped">{error}</Alert>}
-        {success && <Alert tone="success" title="Security operation complete">{success}</Alert>}
       </Stack>
     </Card>
   );

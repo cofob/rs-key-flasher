@@ -3,6 +3,7 @@ import { headers } from "next/headers";
 import { ThemeScript } from "@cofob/design-system-react/static";
 import "@cofob/design-system-css/index.css";
 import "./globals.css";
+import { AppProviders } from "./providers";
 
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
@@ -14,6 +15,12 @@ export async function generateMetadata(): Promise<Metadata> {
   return {
     title,
     description,
+    icons: {
+      icon: [
+        { url: "/favicon.ico", type: "image/x-icon", sizes: "16x16 32x32 48x48" },
+        { url: "/favicon.svg", type: "image/svg+xml", sizes: "any" },
+      ],
+    },
     openGraph: { title, description, images: [{ url: image, width: 1200, height: 630 }] },
     twitter: { card: "summary_large_image", title, description, images: [image] },
   };
@@ -29,7 +36,7 @@ export default function RootLayout({
       <head>
         <ThemeScript />
       </head>
-      <body>{children}</body>
+      <body><AppProviders>{children}</AppProviders></body>
     </html>
   );
 }
