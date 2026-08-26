@@ -10,7 +10,7 @@ export async function generateMetadata(): Promise<Metadata> {
   const protocol = requestHeaders.get("x-forwarded-proto") || (host.startsWith("localhost") ? "http" : "https");
   const image = `${protocol}://${host}/og.png`;
   const title = "RS-Key Web Flasher";
-  const description = "Install RS-Key firmware on a compatible Pico device over USB with read-back verification.";
+  const description = "Install RS-Key firmware on an RP2350 device over USB with read-back verification.";
   return {
     title,
     description,

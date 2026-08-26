@@ -39,8 +39,8 @@ describe("UF2 parser", () => {
     expect(image.segments[0].data).toHaveLength(512);
   });
 
-  it("accepts an RP2040 family image", () => {
-    expect(parseUf2(uf2Block(0, 1, 0x10000000, 0xe48bff56)).productId).toBe(0x0003);
+  it("rejects a legacy RP2 family image", () => {
+    expect(() => parseUf2(uf2Block(0, 1, 0x10000000, 0xe48bff56))).toThrow(/unsupported/);
   });
 
   it("merges sector-aligned erase ranges", () => {

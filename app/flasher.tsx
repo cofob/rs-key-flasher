@@ -25,7 +25,7 @@ import {
   Switch,
   Text,
 } from "@cofob/design-system-react/static";
-import { CheckCircle2, Cpu, ShieldCheck, Usb } from "lucide-react";
+import { CheckCircle2, Cpu, Download as DownloadIcon, ShieldCheck, Usb } from "lucide-react";
 import { flashUf2, hasWebUsb, requestPicobootDevice, type FlashStage } from "../lib/picoboot";
 import {
   firmwareAssets,
@@ -143,7 +143,6 @@ export function Flasher() {
   const [releaseTag, setReleaseTag] = useState("");
   const [showPrereleases, setShowPrereleases] = useState(false);
   const [mode, setMode] = useState<SelectionMode>("easy");
-  const [chip, setChip] = useState("rp2350");
   const [display, setDisplay] = useState(false);
   const [flashSize, setFlashSize] = useState("4");
   const [manualVariant, setManualVariant] = useState("default");
@@ -181,6 +180,14 @@ export function Flasher() {
     : assets.find((asset) => asset.variant === "default")?.variant || assets[0]?.variant || "";
   const variant = mode === "easy" ? easyVariant : effectiveManualVariant;
   const selectedAsset = assets.find((asset) => asset.variant === variant);
+
+  function startDownload() {
+    if (!selectedAsset) return;
+    const link = document.createElement("a");
+    link.href = assetUrl(selectedAsset);
+    link.download = selectedAsset.name;
+    link.click();
+  }
 
   async function startFlash() {
     if (!selectedAsset || busy) return;
@@ -235,7 +242,7 @@ export function Flasher() {
               <Text as="span" className="wordmark">RS-Key Flasher</Text>
             </Inline>
             <Inline gap="sm" align="center" wrap={false}>
-              <Text as="span" size="sm" tone="muted" className="header-protocol">RP2 picoboot</Text>
+              <Text as="span" size="sm" tone="muted" className="header-protocol">RP2350 picoboot</Text>
               <ThemeSwitcher />
             </Inline>
           </Inline>
@@ -248,7 +255,7 @@ export function Flasher() {
             <Stack gap="sm" className="intro">
               <Heading level={1} size="2xl">Flash your RS-Key</Heading>
               <Text tone="muted">
-                Pick the right firmware, connect a compatible Pico in BOOTSEL mode, and install it with read-back verification.
+                Pick the right firmware, connect an RP2350 device in BOOTSEL mode, and install it with read-back verification.
               </Text>
             </Stack>
 
@@ -302,7 +309,7 @@ export function Flasher() {
                         name="selection-mode"
                         value="easy"
                         label="Easy picker"
-                        description="Answer three questions"
+                        description="Answer two questions"
                         checked={mode === "easy"}
                         onChange={() => setMode("easy")}
                       />
@@ -318,15 +325,6 @@ export function Flasher() {
 
                     {mode === "easy" ? (
                       <Stack gap="md" className="picker-questions">
-                        <RadioGroup
-                          name="chip"
-                          label="Which Pico chip do you have?"
-                          disabled={busy}
-                        >
-                          <Radio name="chip" value="rp2350" label="RP2350 / Pico 2" checked={chip === "rp2350"} onChange={() => setChip("rp2350")} />
-                          <Radio name="chip" value="rp2040" label="RP2040 / Pico" checked={chip === "rp2040"} onChange={() => setChip("rp2040")} />
-                          <Radio name="chip" value="unknown" label="Not sure" checked={chip === "unknown"} onChange={() => setChip("unknown")} />
-                        </RadioGroup>
                         <Switch
                           label="Waveshare RP2350-Touch-LCD-2.8 display"
                           description="Select this for the 2.8-inch touch-display board. It uses the 16 MB display image."
@@ -348,11 +346,6 @@ export function Flasher() {
                           <option value="4">4 MB</option>
                           <option value="16">16 MB</option>
                         </Select>
-                        {chip === "rp2040" && (
-                          <Alert tone="warning" title="Check release compatibility">
-                            Current RS-Key releases target RP2350. The flasher supports RP2040 picoboot, but it will refuse an RP2350 UF2 before erase.
-                          </Alert>
-                        )}
                       </Stack>
                     ) : (
                       <Select
@@ -389,7 +382,7 @@ export function Flasher() {
                     )}
 
                     <ol className="bootsel-steps">
-                      <li>Disconnect the Pico device.</li>
+                      <li>Disconnect the RP2350 device.</li>
                       <li>Hold its BOOT or BOOTSEL button.</li>
                       <li>Connect USB, then release the button.</li>
                     </ol>
@@ -398,15 +391,26 @@ export function Flasher() {
                       A wrong 2 MB, 4 MB, 16 MB, or display image can use the wrong storage layout. Secure-boot devices need a UF2 sealed with their own key.
                     </Alert>
 
-                    <Button
-                      startIcon={Usb}
-                      size="lg"
-                      loading={busy}
-                      disabled={!webUsb || !selectedAsset || busy}
-                      onClick={startFlash}
-                    >
-                      {busy ? "Flashing…" : "Connect and flash"}
-                    </Button>
+                    <Inline gap="sm" wrap>
+                      <Button
+                        startIcon={Usb}
+                        size="lg"
+                        loading={busy}
+                        disabled={!webUsb || !selectedAsset || busy}
+                        onClick={startFlash}
+                      >
+                        {busy ? "Flashing…" : "Connect and flash"}
+                      </Button>
+                      <Button
+                        startIcon={DownloadIcon}
+                        size="lg"
+                        variant="secondary"
+                        disabled={!selectedAsset || busy}
+                        onClick={startDownload}
+                      >
+                        Download
+                      </Button>
+                    </Inline>
 
                     {(busy || progress > 0) && (
                       <Progress value={progress} max={100} label={status} showValue animated={busy} />

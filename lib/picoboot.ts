@@ -1,13 +1,11 @@
 import { eraseRanges, type Uf2Image } from "./uf2";
 
 const RASPBERRY_PI_VID = 0x2e8a;
-const RP2040_BOOT_PID = 0x0003;
 const RP2350_BOOT_PID = 0x000f;
 const PICOBOOT_MAGIC = 0x431fd10b;
 const IF_RESET = 0x41;
 const IF_STATUS = 0x42;
 const CMD_EXCLUSIVE = 0x01;
-const CMD_REBOOT = 0x02;
 const CMD_FLASH_ERASE = 0x03;
 const CMD_READ = 0x84;
 const CMD_WRITE = 0x05;
@@ -34,10 +32,7 @@ export function hasWebUsb(): boolean {
 export function requestPicobootDevice(): Promise<USBDevice> {
   if (!hasWebUsb()) throw new Error("This browser does not provide WebUSB.");
   return navigator.usb.requestDevice({
-    filters: [
-      { vendorId: RASPBERRY_PI_VID, productId: RP2040_BOOT_PID },
-      { vendorId: RASPBERRY_PI_VID, productId: RP2350_BOOT_PID },
-    ],
+    filters: [{ vendorId: RASPBERRY_PI_VID, productId: RP2350_BOOT_PID }],
   });
 }
 
@@ -194,13 +189,6 @@ class Picoboot {
   }
 
   async reboot(): Promise<void> {
-    if (this.device.productId === RP2040_BOOT_PID) {
-      const args = new Uint8Array(12);
-      new DataView(args.buffer).setUint32(8, 500, true);
-      await this.command(CMD_REBOOT, args);
-      return;
-    }
-
     const args = new Uint8Array(16);
     const view = new DataView(args.buffer);
     view.setUint32(0, REBOOT_FLASH_UPDATE, true);

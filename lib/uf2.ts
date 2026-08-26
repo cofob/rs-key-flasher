@@ -8,7 +8,6 @@ const XIP_START = 0x10000000;
 const XIP_END = 0x11000000;
 
 export const RP2_FAMILIES = {
-  0xe48bff56: { name: "RP2040", productId: 0x0003 },
   0xe48bff59: { name: "RP2350 Arm Secure", productId: 0x000f },
   0xe48bff5a: { name: "RP2350 RISC-V", productId: 0x000f },
   0xe48bff5b: { name: "RP2350 Arm Non-secure", productId: 0x000f },

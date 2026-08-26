@@ -1,7 +1,7 @@
 # RS-Key Web Flasher
 
 A small Vinext app that installs [RS-Key](https://github.com/TheMaxMur/RS-Key)
-firmware through the RP2 picoboot WebUSB interface. It checks the release
+firmware for RP2350 devices through the picoboot WebUSB interface. It checks the release
 SHA-256 before flashing and reads the flash back before reboot.
 
 ## Requirements
