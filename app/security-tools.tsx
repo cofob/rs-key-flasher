@@ -164,7 +164,7 @@ export function SecurityTools({ asset, localFirmware, webUsb, rawFlashEpoch, ext
   const [enabled, setEnabled] = useState(false);
   const [key, setKey] = useState<SecureBootKey | null>(null);
   const [keyInput, setKeyInput] = useState("");
-  const [useRollback, setUseRollback] = useState(true);
+  const [useRollback, setUseRollback] = useState(false);
   const [rollbackVersion, setRollbackVersion] = useState("1");
   const [signedResult, setSignedResult] = useState<SignedResult | null>(null);
   const [busy, setBusy] = useState(false);
@@ -810,7 +810,7 @@ export function SecurityTools({ asset, localFirmware, webUsb, rawFlashEpoch, ext
               }}
             />
             <Text size="sm" tone="muted">
-              Leave this enabled for the complete production flow. Version 1 is correct for a new device and avoids recreating the image before steps 9–11. The <Link href={RS_KEY_DOCS.antiRollback} external>anti-rollback guide</Link> explains the version floor and the 48-version lifetime budget.
+              Leave this disabled for a standard signed image. Enable it only when you plan to provision anti-rollback. Version 1 is correct for a new device. The <Link href={RS_KEY_DOCS.antiRollback} external>anti-rollback guide</Link> explains the version floor and the 48-version lifetime budget.
             </Text>
             {useRollback && (
               <TextField
