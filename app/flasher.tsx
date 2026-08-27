@@ -31,7 +31,7 @@ import { downloadVerifiedAsset, sha256Hex } from "../lib/assets";
 import { flashUf2, hasWebUsb, requestPicobootDevice, type FlashStage } from "../lib/picoboot";
 import { readSecureBootOtpState } from "../lib/otp";
 import {
-  fetchReleaseAttestation,
+  fetchReleaseAttestations,
   RS_KEY_RELEASES_URL,
   RS_KEY_REPOSITORY_URL,
 } from "../lib/release-attestation";
@@ -196,16 +196,10 @@ export function Flasher() {
       })
       .then(async (data) => {
         if (!useDirectGitHub) return data;
-        const releases = await Promise.all(data.releases.map(async (release) => {
-          try {
-            return { ...release, attestation: await fetchReleaseAttestation(release, directHeaders) };
-          } catch (reason) {
-            console.error("[RS-Key][attestation] Could not load direct GitHub attestation", {
-              tag: release.tag,
-              error: reason instanceof Error ? reason.message : String(reason),
-            });
-            return release;
-          }
+        const attestations = await fetchReleaseAttestations(data.releases, directHeaders);
+        const releases = data.releases.map((release, index) => ({
+          ...release,
+          attestation: attestations[index],
         }));
         return { ...data, releases };
       })

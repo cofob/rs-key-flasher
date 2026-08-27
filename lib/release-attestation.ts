@@ -61,6 +61,10 @@ interface GitHubRefResponse {
   object?: { sha?: string };
 }
 
+interface GitHubMatchingRefResponse extends GitHubRefResponse {
+  ref?: string;
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -129,22 +133,19 @@ export function assertReleaseAttestationClaims(release: Release, attestation: Re
   return statement;
 }
 
-export async function fetchReleaseAttestation(
-  release: Release,
-  headers?: HeadersInit,
-  fetcher: typeof fetch = fetch,
-): Promise<ReleaseAttestation> {
-  const refResponse = await fetcher(
-    `https://api.github.com/repos/${RS_KEY_REPOSITORY}/git/ref/tags/${encodeURIComponent(release.tag)}`,
-    { headers },
-  );
-  if (!refResponse.ok) throw new Error(`GitHub tag lookup returned ${refResponse.status}.`);
-  const ref = await refResponse.json() as GitHubRefResponse;
-  const sha = ref.object?.sha?.toLowerCase() || "";
+function refDigestFromSha(shaValue: string | undefined): string {
+  const sha = shaValue?.toLowerCase() || "";
   const algorithm = sha.length === 64 ? "sha256" : sha.length === 40 ? "sha1" : "";
   if (!algorithm || !/^[0-9a-f]+$/.test(sha)) throw new Error("GitHub returned an invalid tag digest.");
-  const refDigest = `${algorithm}:${sha}`;
+  return `${algorithm}:${sha}`;
+}
 
+async function fetchAttestationForDigest(
+  release: Release,
+  refDigest: string,
+  headers: HeadersInit | undefined,
+  fetcher: typeof fetch,
+): Promise<ReleaseAttestation> {
   const url = new URL(`https://api.github.com/repos/${RS_KEY_REPOSITORY}/attestations/${refDigest}`);
   url.searchParams.set("predicate_type", "release");
   url.searchParams.set("per_page", "100");
@@ -165,4 +166,51 @@ export async function fetchReleaseAttestation(
   };
   assertReleaseAttestationClaims(release, attestation);
   return attestation;
+}
+
+export async function fetchReleaseAttestation(
+  release: Release,
+  headers?: HeadersInit,
+  fetcher: typeof fetch = fetch,
+): Promise<ReleaseAttestation> {
+  const refResponse = await fetcher(
+    `https://api.github.com/repos/${RS_KEY_REPOSITORY}/git/ref/tags/${encodeURIComponent(release.tag)}`,
+    { headers },
+  );
+  if (!refResponse.ok) throw new Error(`GitHub tag lookup returned ${refResponse.status}.`);
+  const ref = await refResponse.json() as GitHubRefResponse;
+  return fetchAttestationForDigest(release, refDigestFromSha(ref.object?.sha), headers, fetcher);
+}
+
+export async function fetchReleaseAttestations(
+  releases: Release[],
+  headers?: HeadersInit,
+  fetcher: typeof fetch = fetch,
+): Promise<ReleaseAttestation[]> {
+  if (!releases.length) return [];
+  const response = await fetcher(
+    `https://api.github.com/repos/${RS_KEY_REPOSITORY}/git/matching-refs/tags/`,
+    { headers },
+  );
+  if (!response.ok) throw new Error(`GitHub tag list lookup returned ${response.status}.`);
+  const refs = await response.json() as GitHubMatchingRefResponse[];
+  if (!Array.isArray(refs)) throw new Error("GitHub returned an invalid tag list.");
+  const tagDigests = new Map(refs.flatMap((ref): Array<[string, string]> => {
+    if (!ref.ref?.startsWith("refs/tags/")) return [];
+    return [[ref.ref.slice("refs/tags/".length), refDigestFromSha(ref.object?.sha)]];
+  }));
+
+  const results = new Array<ReleaseAttestation>(releases.length);
+  let nextIndex = 0;
+  async function loadNext(): Promise<void> {
+    while (nextIndex < releases.length) {
+      const index = nextIndex++;
+      const release = releases[index];
+      const refDigest = tagDigests.get(release.tag);
+      if (!refDigest) throw new Error(`GitHub returned no tag digest for ${release.tag}.`);
+      results[index] = await fetchAttestationForDigest(release, refDigest, headers, fetcher);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(4, releases.length) }, () => loadNext()));
+  return results;
 }

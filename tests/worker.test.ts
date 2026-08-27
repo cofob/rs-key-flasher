@@ -5,11 +5,11 @@ vi.mock("vinext/server/app-router-entry", () => ({
 }));
 
 vi.mock("../lib/release-attestation", () => ({
-  fetchReleaseAttestation: vi.fn(async () => ({
-    repositoryId: 1266469959,
-    refDigest: `sha1:${"a".repeat(40)}`,
-    bundle: {},
-  })),
+  fetchReleaseAttestations: vi.fn(async (releases: unknown[]) => releases.map(() => ({
+      repositoryId: 1266469959,
+      refDigest: `sha1:${"a".repeat(40)}`,
+      bundle: {},
+    }))),
 }));
 
 vi.mock("../lib/release-attestation-server", () => ({
@@ -82,7 +82,7 @@ function cachedRelease() {
 beforeEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
-  vi.mocked(verifyReleaseAttestationServer).mockImplementation(() => undefined);
+  vi.mocked(verifyReleaseAttestationServer).mockResolvedValue(undefined);
   asset.sha256 = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("firmware"))),
     (byte) => byte.toString(16).padStart(2, "0")).join("");
 });
@@ -226,9 +226,7 @@ describe("Worker cache", () => {
 
   it("does not publish assets when the server-side attestation check fails", async () => {
     const kv = new MemoryKv();
-    vi.mocked(verifyReleaseAttestationServer).mockImplementationOnce(() => {
-      throw new Error("invalid keyless signature");
-    });
+    vi.mocked(verifyReleaseAttestationServer).mockRejectedValueOnce(new Error("invalid keyless signature"));
     vi.stubGlobal("fetch", vi.fn(async () => Response.json([{
       id: 100,
       tag_name: "v1.0.0",

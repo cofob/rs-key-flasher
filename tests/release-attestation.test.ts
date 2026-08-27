@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { verifyReleaseAttestationClient } from "../lib/release-attestation-client";
-import { assertReleaseAttestationClaims, fetchReleaseAttestation } from "../lib/release-attestation";
+import {
+  assertReleaseAttestationClaims,
+  fetchReleaseAttestation,
+  fetchReleaseAttestations,
+} from "../lib/release-attestation";
 import { verifyReleaseAttestationServer } from "../lib/release-attestation-server";
 import type { ReleaseAttestation } from "../lib/release-attestation";
 import type { Release } from "../lib/releases";
@@ -11,9 +15,9 @@ function testData(): { release: Release; attestation: ReleaseAttestation } {
 }
 
 describe("GitHub keyless release attestation", () => {
-  it("verifies the official release bundle on the server", () => {
+  it("verifies the official release bundle on the server", async () => {
     const { release, attestation } = testData();
-    expect(() => verifyReleaseAttestationServer(release, attestation)).not.toThrow();
+    await expect(verifyReleaseAttestationServer(release, attestation)).resolves.toBeUndefined();
   });
 
   it("verifies the official release bundle in the browser verifier", async () => {
@@ -37,7 +41,7 @@ describe("GitHub keyless release attestation", () => {
     const { release, attestation } = testData();
     const signature = attestation.bundle.dsseEnvelope!.signatures[0];
     signature.sig = `${signature.sig[0] === "A" ? "B" : "A"}${signature.sig.slice(1)}`;
-    expect(() => verifyReleaseAttestationServer(release, attestation)).toThrow();
+    await expect(verifyReleaseAttestationServer(release, attestation)).rejects.toThrow();
     await expect(verifyReleaseAttestationClient(release, attestation)).rejects.toThrow(/timestamp signature is invalid/);
   });
 
@@ -57,5 +61,25 @@ describe("GitHub keyless release attestation", () => {
 
     await expect(fetchReleaseAttestation(release, undefined, fetcher)).resolves.toEqual(attestation);
     expect(String(fetcher.mock.calls[1][0])).toContain(`/attestations/${attestation.refDigest}`);
+  });
+
+  it("loads tag refs once when it loads a release list", async () => {
+    const { release, attestation } = testData();
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/git/matching-refs/tags/")) {
+        return Response.json([{ ref: `refs/tags/${release.tag}`, object: {
+          sha: attestation.refDigest.slice("sha1:".length),
+        } }]);
+      }
+      return Response.json({ attestations: [{
+        initiator: "github",
+        repository_id: attestation.repositoryId,
+        bundle: attestation.bundle,
+      }] });
+    });
+
+    await expect(fetchReleaseAttestations([release], undefined, fetcher)).resolves.toEqual([attestation]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 });

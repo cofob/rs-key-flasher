@@ -4,7 +4,7 @@
   "private": true,
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
-    "node": "^24.15.0 || >=26.0.0"
+    "node": ">=24.11.0"
   },
   "scripts": {
     "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
@@ -20,9 +20,6 @@
     "@cofob/design-system-react": "0.5.0",
     "@noble/curves": "2.3.0",
     "@scure/bip39": "2.3.0",
-    "@sigstore/bundle": "5.0.0",
-    "@sigstore/protobuf-specs": "0.5.2",
-    "@sigstore/verify": "4.1.2",
     "asn1js": "3.0.10",
     "lucide-react": "^1.34.0",
     "pkijs": "3.4.0",

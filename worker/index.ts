@@ -1,5 +1,5 @@
 import handler from "vinext/server/app-router-entry";
-import { fetchReleaseAttestation } from "../lib/release-attestation";
+import { fetchReleaseAttestations } from "../lib/release-attestation";
 import { verifyReleaseAttestationServer } from "../lib/release-attestation-server";
 import type { Release, ReleaseAsset, ReleaseManifest } from "../lib/releases";
 
@@ -164,9 +164,10 @@ async function getReleases(env: Env, force = false): Promise<{ value: CachedRele
 
     const candidates = sanitizeReleases(await response.json() as GitHubRelease[]);
     if (!candidates.length) throw new Error("GitHub returned no release.");
-    const releases = await Promise.all(candidates.map(async (release): Promise<Release> => {
-      const attestation = await fetchReleaseAttestation(release, githubHeaders(env));
-      verifyReleaseAttestationServer(release, attestation);
+    const attestations = await fetchReleaseAttestations(candidates, githubHeaders(env));
+    const releases = await Promise.all(candidates.map(async (release, index): Promise<Release> => {
+      const attestation = attestations[index];
+      await verifyReleaseAttestationServer(release, attestation);
       return { ...release, attestation };
     }));
     const value: CachedReleases = {
