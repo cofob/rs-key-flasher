@@ -737,7 +737,7 @@ export function SecurityTools({ asset, localFirmware, webUsb, rawFlashEpoch, ext
         <Inline justify="between" align="center" gap="md" wrap>
           <Stack gap="sm">
             <Heading level={2} size="xl">Security tools</Heading>
-            <Text tone="muted">RP2350 secure-boot signing key. This is not an X.509 CA.</Text>
+            <Text tone="muted">RP2350 secure-boot signing key.</Text>
             <Text size="sm">
               Before you provision a device, read the RS-Key <Link href={RS_KEY_DOCS.threatModel} external>threat model</Link> to understand what this hardening does and does not protect.
             </Text>
