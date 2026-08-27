@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   firmwareAssets,
   firmwareProfiles,
+  findOfficialAssetBySha256,
   parseFirmwareAsset,
   recommendVariant,
   releaseManifestFromGitHub,
@@ -25,10 +26,12 @@ describe("release asset parsing", () => {
   it("ignores non-firmware assets", () => {
     expect(parseFirmwareAsset({ ...asset, name: "SHA256SUMS" }, "v0.4.10")).toBeNull();
     expect(firmwareAssets({
+      id: 10,
       tag: "v0.4.10",
       name: "release",
       publishedAt: "",
       prerelease: false,
+      immutable: true,
       assets: [asset, { ...asset, id: 2, name: "SHA256SUMS" }],
     })).toHaveLength(1);
   });
@@ -53,13 +56,29 @@ describe("release asset parsing", () => {
     expect(firmwareProfiles(assets)).toEqual(["default", "fips", "fips-pqc"]);
   });
 
+  it("finds a local UF2 digest in all official release assets", () => {
+    const release = {
+      id: 10,
+      tag: "v0.4.10",
+      name: "release",
+      publishedAt: "",
+      prerelease: false,
+      immutable: true,
+      assets: [asset],
+    };
+    expect(findOfficialAssetBySha256([release], asset.sha256)).toEqual({ tag: "v0.4.10", asset });
+    expect(findOfficialAssetBySha256([release], "f".repeat(64))).toBeUndefined();
+  });
+
   it("converts the direct GitHub response and keeps its download URL", () => {
     const manifest = releaseManifestFromGitHub([{
+      id: 100,
       tag_name: "v0.4.10",
       name: "RS-Key 0.4.10",
       published_at: "2026-01-01T00:00:00Z",
       prerelease: false,
       draft: false,
+      immutable: true,
       assets: [{
         id: 17,
         name: "rs-key-v0.4.10-default.uf2",

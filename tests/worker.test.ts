@@ -4,7 +4,20 @@ vi.mock("vinext/server/app-router-entry", () => ({
   default: { fetch: vi.fn(async () => new Response("app")) },
 }));
 
+vi.mock("../lib/release-attestation", () => ({
+  fetchReleaseAttestation: vi.fn(async () => ({
+    repositoryId: 1266469959,
+    refDigest: `sha1:${"a".repeat(40)}`,
+    bundle: {},
+  })),
+}));
+
+vi.mock("../lib/release-attestation-server", () => ({
+  verifyReleaseAttestationServer: vi.fn(),
+}));
+
 import worker, { r2Key, syncMirror } from "../worker/index";
+import { verifyReleaseAttestationServer } from "../lib/release-attestation-server";
 
 class MemoryKv {
   values = new Map<string, string>();
@@ -53,9 +66,23 @@ const asset = {
   sha256: "",
 };
 
+function cachedRelease() {
+  return {
+    id: 100,
+    tag: "v1.0.0",
+    name: "v1",
+    publishedAt: "",
+    prerelease: false,
+    immutable: true,
+    assets: [asset],
+    attestation: { repositoryId: 1266469959, refDigest: `sha1:${"a".repeat(40)}`, bundle: {} },
+  };
+}
+
 beforeEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.mocked(verifyReleaseAttestationServer).mockImplementation(() => undefined);
   asset.sha256 = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("firmware"))),
     (byte) => byte.toString(16).padStart(2, "0")).join("");
 });
@@ -63,9 +90,9 @@ beforeEach(async () => {
 describe("Worker cache", () => {
   it("serves release metadata from the Cloudflare edge cache", async () => {
     const kv = new MemoryKv();
-    kv.values.set("releases:v1", JSON.stringify({
+    kv.values.set("releases:v2", JSON.stringify({
       refreshedAt: Date.now(),
-      releases: [{ tag: "v1.0.0", name: "v1", publishedAt: "", prerelease: false, assets: [asset] }],
+      releases: [cachedRelease()],
     }));
     const edge = new MemoryEdgeCache();
     vi.stubGlobal("caches", { default: edge });
@@ -94,9 +121,9 @@ describe("Worker cache", () => {
 
   it("serves a verified R2 asset from the Cloudflare edge cache", async () => {
     const kv = new MemoryKv();
-    kv.values.set("releases:v1", JSON.stringify({
+    kv.values.set("releases:v2", JSON.stringify({
       refreshedAt: Date.now(),
-      releases: [{ tag: "v1.0.0", name: "v1", publishedAt: "", prerelease: false, assets: [asset] }],
+      releases: [cachedRelease()],
     }));
     const edge = new MemoryEdgeCache();
     vi.stubGlobal("caches", { default: edge });
@@ -138,9 +165,9 @@ describe("Worker cache", () => {
 
   it("keeps the original filename in the R2 key and response", async () => {
     const kv = new MemoryKv();
-    kv.values.set("releases:v1", JSON.stringify({
+    kv.values.set("releases:v2", JSON.stringify({
       refreshedAt: Date.now(),
-      releases: [{ tag: "v1.0.0", name: "v1", publishedAt: "", prerelease: false, assets: [asset] }],
+      releases: [cachedRelease()],
     }));
 
     const writes: Array<{ key: string; bytes: Uint8Array; options: unknown }> = [];
@@ -179,9 +206,9 @@ describe("Worker cache", () => {
 
   it("serves stale KV metadata when GitHub is down", async () => {
     const kv = new MemoryKv();
-    kv.values.set("releases:v1", JSON.stringify({
+    kv.values.set("releases:v2", JSON.stringify({
       refreshedAt: 1,
-      releases: [{ tag: "v1.0.0", name: "v1", publishedAt: "", prerelease: false, assets: [asset] }],
+      releases: [cachedRelease()],
     }));
     vi.stubGlobal("fetch", vi.fn(async () => new Response("down", { status: 503 })));
 
@@ -195,6 +222,33 @@ describe("Worker cache", () => {
     expect(response.status).toBe(200);
     expect(manifest.stale).toBe(true);
     expect(manifest.releases).toHaveLength(1);
+  });
+
+  it("does not publish assets when the server-side attestation check fails", async () => {
+    const kv = new MemoryKv();
+    vi.mocked(verifyReleaseAttestationServer).mockImplementationOnce(() => {
+      throw new Error("invalid keyless signature");
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json([{
+      id: 100,
+      tag_name: "v1.0.0",
+      name: "v1",
+      published_at: "",
+      prerelease: false,
+      draft: false,
+      immutable: true,
+      assets: [{ ...asset, digest: `sha256:${asset.sha256}` }],
+    }])));
+
+    const response = await worker.fetch(
+      new Request("https://flasher.test/api/releases"),
+      { GITHUB_CACHE: kv } as never,
+      context(),
+    );
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toMatchObject({ error: expect.stringContaining("invalid keyless signature") });
+    expect(kv.values.has("releases:v2")).toBe(false);
   });
 
   it("uses the release tag and exact filename for R2 paths", () => {
@@ -221,11 +275,13 @@ describe("Worker cache", () => {
       const url = String(input);
       if (url.includes("api.github.com")) {
         return new Response(JSON.stringify([{
+          id: 100,
           tag_name: "v1.0.0",
           name: "v1",
           published_at: "",
           prerelease: false,
           draft: false,
+          immutable: true,
           assets: [first, second],
         }]), { headers: { ETag: "test" } });
       }

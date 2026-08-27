@@ -1,3 +1,5 @@
+import type { ReleaseAttestation } from "./release-attestation";
+
 export interface ReleaseAsset {
   id: number;
   name: string;
@@ -7,11 +9,14 @@ export interface ReleaseAsset {
 }
 
 export interface Release {
+  id: number;
   tag: string;
   name: string;
   publishedAt: string;
   prerelease: boolean;
+  immutable: boolean;
   assets: ReleaseAsset[];
+  attestation?: ReleaseAttestation;
 }
 
 export interface ReleaseManifest {
@@ -35,21 +40,27 @@ interface GitHubAsset {
 }
 
 interface GitHubRelease {
+  id: number;
   tag_name: string;
   name: string | null;
   published_at: string | null;
   prerelease: boolean;
   draft: boolean;
+  immutable: boolean;
   assets: GitHubAsset[];
 }
 
 export function releaseManifestFromGitHub(raw: unknown, refreshedAt = new Date().toISOString()): ReleaseManifest {
   if (!Array.isArray(raw)) throw new Error("GitHub returned an invalid release list.");
-  const releases = (raw as GitHubRelease[]).filter((release) => !release.draft).map((release): Release => ({
+  const releases = (raw as GitHubRelease[]).filter((release) =>
+    !release.draft && Number.isSafeInteger(release.id),
+  ).map((release): Release => ({
+    id: release.id,
     tag: release.tag_name,
     name: release.name || release.tag_name,
     publishedAt: release.published_at || "",
     prerelease: release.prerelease,
+    immutable: release.immutable === true,
     assets: Array.isArray(release.assets) ? release.assets.flatMap((asset): ReleaseAsset[] => {
       const sha256 = asset.digest?.match(/^sha256:([0-9a-f]{64})$/i)?.[1]?.toLowerCase();
       if (!sha256 || !Number.isSafeInteger(asset.id) || !Number.isSafeInteger(asset.size) || asset.size <= 0) return [];
@@ -86,6 +97,14 @@ export function firmwareAssets(release: Release): FirmwareAsset[] {
     .map((asset) => parseFirmwareAsset(asset, release.tag))
     .filter((asset): asset is FirmwareAsset => asset !== null)
     .sort((a, b) => a.variant.localeCompare(b.variant));
+}
+
+export function findOfficialAssetBySha256(releases: Release[], sha256: string): { tag: string; asset: ReleaseAsset } | undefined {
+  for (const release of releases) {
+    const asset = release.assets.find((candidate) => candidate.sha256 === sha256);
+    if (asset) return { tag: release.tag, asset };
+  }
+  return undefined;
 }
 
 export function recommendVariant(hasDisplay: boolean, flashSize: string, profile = "default"): string {

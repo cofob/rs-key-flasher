@@ -1,8 +1,10 @@
 import handler from "vinext/server/app-router-entry";
+import { fetchReleaseAttestation } from "../lib/release-attestation";
+import { verifyReleaseAttestationServer } from "../lib/release-attestation-server";
 import type { Release, ReleaseAsset, ReleaseManifest } from "../lib/releases";
 
 const REPOSITORY = "TheMaxMur/RS-Key";
-const RELEASES_KEY = "releases:v1";
+const RELEASES_KEY = "releases:v2";
 const MIRROR_KEY = "mirror:v1";
 const HOUR = 60 * 60 * 1000;
 const RETRY_DELAY = 5 * 60 * 1000;
@@ -45,11 +47,13 @@ interface GitHubAsset {
 }
 
 interface GitHubRelease {
+  id: number;
   tag_name: string;
   name: string | null;
   published_at: string | null;
   prerelease: boolean;
   draft: boolean;
+  immutable: boolean;
   assets: GitHubAsset[];
 }
 
@@ -95,6 +99,7 @@ function assetCacheKey(
 ): Request {
   const url = new URL(request.url);
   url.search = new URLSearchParams({
+    attestation: "github-release-v1",
     tag,
     name,
     sha256,
@@ -116,11 +121,13 @@ function githubHeaders(env: Env, etag?: string): Headers {
 }
 
 function sanitizeReleases(raw: GitHubRelease[]): Release[] {
-  return raw.filter((release) => !release.draft).map((release) => ({
+  return raw.filter((release) => !release.draft && Number.isSafeInteger(release.id)).map((release) => ({
+    id: release.id,
     tag: release.tag_name,
     name: release.name || release.tag_name,
     publishedAt: release.published_at || "",
     prerelease: release.prerelease,
+    immutable: release.immutable === true,
     assets: release.assets.flatMap((asset): ReleaseAsset[] => {
       const sha256 = asset.digest?.match(/^sha256:([0-9a-f]{64})$/i)?.[1]?.toLowerCase();
       if (!sha256) return [];
@@ -155,7 +162,13 @@ async function getReleases(env: Env, force = false): Promise<{ value: CachedRele
     }
     if (!response.ok) throw new Error(`GitHub returned ${response.status}`);
 
-    const releases = sanitizeReleases(await response.json() as GitHubRelease[]);
+    const candidates = sanitizeReleases(await response.json() as GitHubRelease[]);
+    if (!candidates.length) throw new Error("GitHub returned no release.");
+    const releases = await Promise.all(candidates.map(async (release): Promise<Release> => {
+      const attestation = await fetchReleaseAttestation(release, githubHeaders(env));
+      verifyReleaseAttestationServer(release, attestation);
+      return { ...release, attestation };
+    }));
     const value: CachedReleases = {
       etag: response.headers.get("ETag") || undefined,
       refreshedAt: now,
@@ -229,7 +242,7 @@ async function fetchAsset(tag: string, name: string, size: number): Promise<Resp
 function findAsset(releases: Release[], id: number, tag: string, name: string, size: number, sha256: string): boolean {
   const release = releases.find((candidate) => candidate.tag === tag);
   const asset = release?.assets.find((candidate) => candidate.id === id);
-  return Boolean(asset && asset.name === name && asset.size === size && asset.sha256 === sha256);
+  return Boolean(release?.attestation && asset && asset.name === name && asset.size === size && asset.sha256 === sha256);
 }
 
 async function serveAsset(request: Request, env: Env, ctx: WorkerContext, assetId: number): Promise<Response> {
@@ -248,8 +261,15 @@ async function serveAsset(request: Request, env: Env, ctx: WorkerContext, assetI
   const edgeCached = await defaultEdgeCache()?.match(edgeKey);
   if (edgeCached) return edgeHit(edgeCached);
 
-  const cachedManifest = await readCachedReleases(env);
-  if (cachedManifest && !findAsset(cachedManifest.releases, assetId, tag, name, size, sha256)) {
+  let manifest = await readCachedReleases(env);
+  if (!manifest) {
+    try {
+      manifest = (await getReleases(env)).value;
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : "Release attestation is unavailable." }, { status: 502 });
+    }
+  }
+  if (!findAsset(manifest.releases, assetId, tag, name, size, sha256)) {
     return json({ error: "Asset is not present in the cached RS-Key release manifest." }, { status: 404 });
   }
 

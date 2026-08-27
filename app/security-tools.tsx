@@ -61,6 +61,8 @@ interface SecurityToolsProps {
   externalBusy: boolean;
   operationLockRef: MutableRefObject<boolean>;
   onBusyChange: (busy: boolean) => void;
+  releaseAssetTrusted: boolean;
+  directGitHub: boolean;
 }
 
 interface ProvisioningStepProps {
@@ -157,7 +159,17 @@ function stateSummary(state: SecureBootOtpState): string {
   return `serial ${state.serial} · secure boot ${state.secureBootEnabled ? "enabled" : "off"} · trusted slots ${trusted} · rollback ${state.rollbackRequired ? "required" : "optional"} ${state.bootVersion}/48 · page 58 ${state.page58}`;
 }
 
-export function SecurityTools({ asset, localFirmware, webUsb, rawFlashEpoch, externalBusy, operationLockRef, onBusyChange }: SecurityToolsProps) {
+export function SecurityTools({
+  asset,
+  localFirmware,
+  webUsb,
+  rawFlashEpoch,
+  externalBusy,
+  operationLockRef,
+  onBusyChange,
+  releaseAssetTrusted,
+  directGitHub,
+}: SecurityToolsProps) {
   const { toast, dismiss } = useToast();
   const operationNameRef = useRef("Security operation");
   const stageLogRef = useRef("");
@@ -352,6 +364,10 @@ export function SecurityTools({ asset, localFirmware, webUsb, rawFlashEpoch, ext
 
   async function createSignedUf2(): Promise<void> {
     if (!asset || !key) return;
+    if (!releaseAssetTrusted) {
+      setError("The GitHub release attestation has not been verified in this browser.");
+      return;
+    }
     if (!beginOperation("Create signed UF2")) return;
     setError("");
     setSuccess("");
@@ -360,7 +376,7 @@ export function SecurityTools({ asset, localFirmware, webUsb, rawFlashEpoch, ext
       setStatus(localFirmware ? "Checking local firmware…" : "Downloading and checking original firmware…");
       const original = localFirmware
         ? localFirmware.slice()
-        : await downloadVerifiedAsset(asset, (value) => setProgress(1 + value * 39));
+        : await downloadVerifiedAsset(asset, (value) => setProgress(1 + value * 39), directGitHub);
       if (original.length !== asset.size || await sha256Hex(original) !== asset.sha256) {
         throw new Error("The firmware bytes do not match the selected SHA-256 and size.");
       }
@@ -801,6 +817,11 @@ export function SecurityTools({ asset, localFirmware, webUsb, rawFlashEpoch, ext
             <Heading level={3} size="lg">2. Create signed UF2</Heading>
             <Text size="sm" tone="muted">Create the recovery image first. The same image is reused throughout provisioning and for every restore test.</Text>
             <Text size="sm" tone="muted">{asset?.name || "Choose a release and variant above."}</Text>
+            {asset && !releaseAssetTrusted && (
+              <Alert tone="danger" title="Release attestation is not verified">
+                Verify the selected GitHub release before you create a signed UF2.
+              </Alert>
+            )}
             <Switch
               label="Add anti-rollback version"
               checked={useRollback}
@@ -826,7 +847,7 @@ export function SecurityTools({ asset, localFirmware, webUsb, rawFlashEpoch, ext
             )}
             <Button
               startIcon={ShieldCheck}
-              disabled={!asset || !key || operationBusy}
+              disabled={!asset || !key || operationBusy || !releaseAssetTrusted}
               loading={busy && status.includes("signed")}
               onClick={createSignedUf2}
             >

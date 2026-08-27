@@ -27,12 +27,18 @@ import {
   TextField,
 } from "@cofob/design-system-react/static";
 import { CheckCircle2, Cpu, Download as DownloadIcon, ShieldCheck, Usb } from "lucide-react";
-import { assetUrl, downloadVerifiedAsset, sha256Hex } from "../lib/assets";
+import { downloadVerifiedAsset, sha256Hex } from "../lib/assets";
 import { flashUf2, hasWebUsb, requestPicobootDevice, type FlashStage } from "../lib/picoboot";
 import { readSecureBootOtpState } from "../lib/otp";
 import {
+  fetchReleaseAttestation,
+  RS_KEY_RELEASES_URL,
+  RS_KEY_REPOSITORY_URL,
+} from "../lib/release-attestation";
+import {
   firmwareAssets,
   firmwareProfiles,
+  findOfficialAssetBySha256,
   recommendVariant,
   releaseManifestFromGitHub,
   variantLabel,
@@ -44,10 +50,20 @@ import { SecurityTools } from "./security-tools";
 
 type SelectionMode = "easy" | "manual";
 type FirmwareSource = "releases" | "local";
+type AttestationCheck = { status: "pending" | "verified" | "failed"; error?: string };
 
 const API_SOURCE_KEY = "rs-key-flasher-api-source";
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/TheMaxMur/RS-Key/releases?per_page=100";
 const MAX_LOCAL_UF2_SIZE = 32 * 1024 * 1024;
+
+function downloadBytes(name: string, bytes: Uint8Array): void {
+  const url = URL.createObjectURL(new Blob([bytes.slice().buffer], { type: "application/octet-stream" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
 
 function flashPercent(stage: FlashStage, completed: number, total: number): number {
   const ratio = total ? completed / total : 0;
@@ -121,12 +137,14 @@ export function Flasher() {
   const [localBytes, setLocalBytes] = useState<Uint8Array | null>(null);
   const [localError, setLocalError] = useState("");
   const [directGitHub, setDirectGitHub] = useState(false);
+  const [attestationChecks, setAttestationChecks] = useState<Record<string, AttestationCheck>>({});
   const [mode, setMode] = useState<SelectionMode>("easy");
   const [display, setDisplay] = useState(false);
   const [flashSize, setFlashSize] = useState("4");
   const [profile, setProfile] = useState("default");
   const [manualVariant, setManualVariant] = useState("default");
   const [busy, setBusy] = useState(false);
+  const [downloadBusy, setDownloadBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState("Ready");
   const [error, setError] = useState("");
@@ -136,7 +154,7 @@ export function Flasher() {
   const [securityBusy, setSecurityBusy] = useState(false);
   const operationLock = useRef(false);
   const flashLogRef = useRef("");
-  const operationBusy = busy || securityBusy;
+  const operationBusy = busy || downloadBusy || securityBusy;
 
   useEffect(() => {
     if (!busy) return;
@@ -164,7 +182,8 @@ export function Flasher() {
     const releasesUrl = useDirectGitHub
       ? GITHUB_RELEASES_URL
       : `${import.meta.env.VITE_FLASHER_API_BASE || ""}/api/releases`;
-    fetch(releasesUrl, useDirectGitHub ? { headers: { Accept: "application/vnd.github+json" } } : undefined)
+    const directHeaders = { Accept: "application/vnd.github+json" };
+    fetch(releasesUrl, useDirectGitHub ? { headers: directHeaders } : undefined)
       .then(async (response) => {
         const body = await response.json() as unknown;
         if (!response.ok) {
@@ -175,13 +194,62 @@ export function Flasher() {
         }
         return useDirectGitHub ? releaseManifestFromGitHub(body) : body as ReleaseManifest;
       })
+      .then(async (data) => {
+        if (!useDirectGitHub) return data;
+        const releases = await Promise.all(data.releases.map(async (release) => {
+          try {
+            return { ...release, attestation: await fetchReleaseAttestation(release, directHeaders) };
+          } catch (reason) {
+            console.error("[RS-Key][attestation] Could not load direct GitHub attestation", {
+              tag: release.tag,
+              error: reason instanceof Error ? reason.message : String(reason),
+            });
+            return release;
+          }
+        }));
+        return { ...data, releases };
+      })
       .then((data) => {
+        setAttestationChecks({});
         setManifest(data);
         const stable = data.releases.find((release) => !release.prerelease);
         setReleaseTag(stable?.tag || data.releases[0]?.tag || "");
       })
       .catch((reason) => setReleaseError(reason instanceof Error ? reason.message : "Could not load releases."));
   }, []);
+
+  useEffect(() => {
+    if (!manifest) return;
+    let cancelled = false;
+    void (async () => {
+      let verifyReleaseAttestationClient: typeof import("../lib/release-attestation-client").verifyReleaseAttestationClient;
+      try {
+        ({ verifyReleaseAttestationClient } = await import("../lib/release-attestation-client"));
+      } catch (reason) {
+        if (!cancelled) {
+          const error = reason instanceof Error ? reason.message : "The browser verifier could not start.";
+          setAttestationChecks(Object.fromEntries(
+            manifest.releases.map((release) => [release.tag, { status: "failed", error } satisfies AttestationCheck]),
+          ));
+        }
+        return;
+      }
+      const checks = await Promise.all(manifest.releases.map(async (release): Promise<[string, AttestationCheck]> => {
+        try {
+          if (!release.attestation) throw new Error("The release has no GitHub keyless attestation.");
+          await verifyReleaseAttestationClient(release, release.attestation);
+          return [release.tag, { status: "verified" }];
+        } catch (reason) {
+          return [release.tag, {
+            status: "failed",
+            error: reason instanceof Error ? reason.message : "The release attestation is invalid.",
+          }];
+        }
+      }));
+      if (!cancelled) setAttestationChecks(Object.fromEntries(checks));
+    })();
+    return () => { cancelled = true; };
+  }, [manifest]);
 
   const visibleReleases = useMemo(
     () => manifest?.releases.filter((release) => showPrereleases || !release.prerelease) || [],
@@ -198,6 +266,22 @@ export function Flasher() {
   const variant = mode === "easy" ? easyVariant : effectiveManualVariant;
   const releaseAsset = assets.find((asset) => asset.variant === variant);
   const selectedAsset = firmwareSource === "local" ? localAsset || undefined : releaseAsset;
+  const releaseAttestation = release
+    ? attestationChecks[release.tag] || { status: "pending" as const }
+    : undefined;
+  const releaseTrusted = releaseAttestation?.status === "verified";
+  const verifiedOfficialReleases = manifest?.releases.filter((item) =>
+    attestationChecks[item.tag]?.status === "verified",
+  ) || [];
+  const officialComparisonReady = Boolean(manifest && manifest.releases.length && manifest.releases.every((item) =>
+    attestationChecks[item.tag]?.status === "verified",
+  ));
+  const officialComparisonFailed = Boolean(manifest && manifest.releases.some((item) =>
+    attestationChecks[item.tag]?.status === "failed",
+  ));
+  const localOfficialMatch = localAsset && officialComparisonReady
+    ? findOfficialAssetBySha256(verifiedOfficialReleases, localAsset.sha256)
+    : undefined;
 
   async function chooseLocalUf2(file?: File): Promise<void> {
     setLocalAsset(null);
@@ -231,17 +315,44 @@ export function Flasher() {
     location.reload();
   }
 
-  function startDownload() {
+  async function startDownload(): Promise<void> {
     if (!releaseAsset || firmwareSource !== "releases" || operationLock.current) return;
+    if (!releaseTrusted) {
+      setError("The GitHub release attestation has not been verified in this browser.");
+      return;
+    }
+    operationLock.current = true;
     setRawFlashEpoch((value) => value + 1);
-    const link = document.createElement("a");
-    link.href = assetUrl(releaseAsset, directGitHub);
-    link.download = releaseAsset.name;
-    link.click();
+    setDownloadBusy(true);
+    setError("");
+    setSuccess("");
+    setProgress(1);
+    setStatus("Downloading and checking the official UF2…");
+    try {
+      const bytes = await downloadVerifiedAsset(
+        releaseAsset,
+        (value) => setProgress(1 + value * 99),
+        directGitHub,
+      );
+      downloadBytes(releaseAsset.name, bytes);
+      setProgress(100);
+      setStatus("Attestation and SHA-256 verified");
+      setSuccess(`${releaseAsset.name} was verified and downloaded.`);
+    } catch (reason) {
+      setStatus("Stopped");
+      setError(reason instanceof Error ? reason.message : "Firmware download failed.");
+    } finally {
+      setDownloadBusy(false);
+      operationLock.current = false;
+    }
   }
 
   async function startFlash() {
     if (!selectedAsset || operationLock.current) return;
+    if (firmwareSource === "releases" && !releaseTrusted) {
+      setError("The GitHub release attestation has not been verified in this browser.");
+      return;
+    }
 
     flashLogRef.current = "";
     console.info("[RS-Key][flasher] Flash started", {
@@ -266,7 +377,7 @@ export function Flasher() {
       setStatus(firmwareSource === "local" ? "Reading local firmware…" : "Downloading firmware…");
       const bytes = firmwareSource === "local"
         ? localBytes?.slice()
-        : await downloadVerifiedAsset(selectedAsset, (value) => setProgress(5 + value * 20));
+        : await downloadVerifiedAsset(selectedAsset, (value) => setProgress(5 + value * 20), directGitHub);
       if (!bytes) throw new Error("Select a local UF2 file.");
 
       setStatus("Checking firmware SHA-256…");
@@ -384,6 +495,24 @@ export function Flasher() {
                           disabled={operationBusy}
                           onChange={(event) => setShowPrereleases(event.target.checked)}
                         />
+                        <Text size="sm" tone="muted">
+                          Source: <Link href={RS_KEY_REPOSITORY_URL} external>official RS-Key repository</Link>
+                        </Text>
+                        {releaseAttestation?.status === "pending" && (
+                          <Alert tone="warning" title="Verifying the GitHub release">
+                            This browser is checking the keyless release attestation.
+                          </Alert>
+                        )}
+                        {releaseAttestation?.status === "verified" && (
+                          <Alert tone="success" title="GitHub release verified" icon={ShieldCheck}>
+                            The keyless attestation, Git tag, and all release asset SHA-256 values are valid.
+                          </Alert>
+                        )}
+                        {releaseAttestation?.status === "failed" && (
+                          <Alert tone="danger" title="GitHub release attestation failed">
+                            {releaseAttestation.error || "This browser could not verify the release."}
+                          </Alert>
+                        )}
                       </>
                     ) : (
                       <Stack gap="sm">
@@ -399,6 +528,21 @@ export function Flasher() {
                         />
                         <Text size="sm" tone="muted">The file stays in this browser. Its format and SHA-256 are checked before use.</Text>
                         {localError && <Alert tone="danger" title="Invalid UF2">{localError}</Alert>}
+                        {localAsset && officialComparisonReady && localOfficialMatch && (
+                          <Alert tone="success" title="Official release SHA-256 match" icon={ShieldCheck}>
+                            This file matches {localOfficialMatch.asset.name} from release {localOfficialMatch.tag}.
+                          </Alert>
+                        )}
+                        {localAsset && officialComparisonReady && !localOfficialMatch && (
+                          <Alert tone="warning" title="This UF2 is not in an official RS-Key release">
+                            Its SHA-256 does not match any official release asset. You can continue. If you do not trust this file, download a UF2 from the <Link href={RS_KEY_RELEASES_URL} external>official RS-Key releases</Link>.
+                          </Alert>
+                        )}
+                        {localAsset && officialComparisonFailed && (
+                          <Alert tone="warning" title="Official SHA-256 comparison is unavailable">
+                            This browser could not verify the complete official release list. You can continue. If you do not trust this file, download a UF2 from the <Link href={RS_KEY_RELEASES_URL} external>official RS-Key releases</Link>.
+                          </Alert>
+                        )}
                       </Stack>
                     )}
                   </Stack>
@@ -519,7 +663,8 @@ export function Flasher() {
                         startIcon={Usb}
                         size="lg"
                         loading={busy}
-                        disabled={!webUsb || !selectedAsset || operationBusy}
+                        disabled={!webUsb || !selectedAsset || operationBusy ||
+                          (firmwareSource === "releases" && !releaseTrusted)}
                         onClick={startFlash}
                       >
                         {busy ? "Flashing…" : "Connect and flash"}
@@ -529,19 +674,20 @@ export function Flasher() {
                           startIcon={DownloadIcon}
                           size="lg"
                           variant="secondary"
-                          disabled={!selectedAsset || operationBusy}
-                          onClick={startDownload}
+                          loading={downloadBusy}
+                          disabled={!selectedAsset || operationBusy || !releaseTrusted}
+                          onClick={() => void startDownload()}
                         >
-                          Download original UF2
+                          {downloadBusy ? "Downloading…" : "Download original UF2"}
                         </Button>
                       )}
                     </Inline>
 
                     {(busy || progress > 0) && (
-                      <Progress value={progress} max={100} label={status} showValue animated={busy} />
+                      <Progress value={progress} max={100} label={status} showValue animated={busy || downloadBusy} />
                     )}
-                    {error && <Alert tone="danger" title="Flash failed">{error}</Alert>}
-                    {success && <Alert tone="success" title="Flash verified" icon={ShieldCheck}>{success}</Alert>}
+                    {error && <Alert tone="danger" title="Operation failed">{error}</Alert>}
+                    {success && <Alert tone="success" title="Operation verified" icon={ShieldCheck}>{success}</Alert>}
                   </Stack>
                 </Card>
               </Stack>
@@ -552,9 +698,11 @@ export function Flasher() {
               localFirmware={firmwareSource === "local" ? localBytes || undefined : undefined}
               webUsb={webUsb}
               rawFlashEpoch={rawFlashEpoch}
-              externalBusy={busy}
+              externalBusy={busy || downloadBusy}
               operationLockRef={operationLock}
               onBusyChange={setSecurityBusy}
+              releaseAssetTrusted={firmwareSource === "local" || releaseTrusted}
+              directGitHub={directGitHub}
             />
 
             <footer className="site-footer">

@@ -7,7 +7,9 @@ A web app for downloading, signing, and flashing [RS-Key](https://github.com/The
 ## Features
 
 - Select a release or local UF2 file.
-- Verify firmware before downloading or flashing.
+- Verify the GitHub immutable-release attestation in the Worker and in the browser.
+- Verify firmware SHA-256 before downloading or flashing.
+- Compare a local UF2 SHA-256 with all official release assets.
 - Create per-device signed UF2 files.
 - Follow a guided Secure Boot and OTP provisioning flow.
 
@@ -26,6 +28,8 @@ npm run build
 ```
 
 Secure Boot and OTP changes can be permanent. Read the warnings in the app before provisioning a device.
+
+`lib/github-trusted-root.json` contains the GitHub Sigstore trust root used for offline verification. Refresh it with a current `gh attestation trusted-root` result when GitHub rotates this root.
 
 ## License
 
