@@ -20,6 +20,7 @@
     {
       "binding": "PREVIEWS",
       "database_name": "rs-key-flasher-previews",
+      "database_id": "3ee2211b-fa03-4efa-a101-152477e725ab",
       "migrations_dir": "migrations"
     }
   ],
