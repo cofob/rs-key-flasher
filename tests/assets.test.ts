@@ -3,6 +3,7 @@ import { assetUrl } from "../lib/assets";
 import type { FirmwareAsset } from "../lib/releases";
 
 const asset: FirmwareAsset = {
+  source: "release",
   id: 42,
   name: "rs-key-v1.0.0-fips-pqc.uf2",
   size: 8192,

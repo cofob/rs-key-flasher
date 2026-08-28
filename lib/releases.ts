@@ -25,11 +25,27 @@ export interface ReleaseManifest {
   releases: Release[];
 }
 
-export interface FirmwareAsset extends ReleaseAsset {
-  tag: string;
-  version: string;
+interface FirmwareAssetBase extends ReleaseAsset {
   variant: string;
+  version: string;
 }
+
+export interface ReleaseFirmwareAsset extends FirmwareAssetBase {
+  source: "release";
+  tag: string;
+}
+
+export interface PreviewFirmwareAsset extends FirmwareAssetBase {
+  source: "preview";
+  buildId: string;
+  commitSha: string;
+}
+
+export interface LocalFirmwareAsset extends FirmwareAssetBase {
+  source: "local";
+}
+
+export type FirmwareAsset = ReleaseFirmwareAsset | PreviewFirmwareAsset | LocalFirmwareAsset;
 
 interface GitHubAsset {
   id: number;
@@ -76,7 +92,7 @@ export function releaseManifestFromGitHub(raw: unknown, refreshedAt = new Date()
   return { refreshedAt, stale: false, releases };
 }
 
-export function parseFirmwareAsset(asset: ReleaseAsset, tag: string): FirmwareAsset | null {
+export function parseFirmwareAsset(asset: ReleaseAsset, tag: string): ReleaseFirmwareAsset | null {
   const prefix = `rs-key-${tag}-`;
   const suffix = ".uf2";
   if (!asset.name.startsWith(prefix) || !asset.name.endsWith(suffix)) return null;
@@ -86,6 +102,7 @@ export function parseFirmwareAsset(asset: ReleaseAsset, tag: string): FirmwareAs
 
   return {
     ...asset,
+    source: "release",
     tag,
     version: tag.startsWith("v") ? tag.slice(1) : tag,
     variant,
@@ -95,7 +112,7 @@ export function parseFirmwareAsset(asset: ReleaseAsset, tag: string): FirmwareAs
 export function firmwareAssets(release: Release): FirmwareAsset[] {
   return release.assets
     .map((asset) => parseFirmwareAsset(asset, release.tag))
-    .filter((asset): asset is FirmwareAsset => asset !== null)
+    .filter((asset): asset is ReleaseFirmwareAsset => asset !== null)
     .sort((a, b) => a.variant.localeCompare(b.variant));
 }
 
@@ -138,6 +155,12 @@ const VARIANT_LABELS: Record<string, string> = {
   "strict-up": "Strict touch policy",
   "strict-up-pqc": "Strict touch + post-quantum",
   "strict-config": "Strict configuration writes",
+  "board-waveshare-one": "Waveshare RP2350-One",
+  "board-tenstar-usb": "Tenstar RP2350 USB",
+  "board-seeed-xiao": "Seeed XIAO RP2350",
+  "board-waveshare-touch-lcd": "Waveshare touch display",
+  "board-abrobot-4m": "Abrobot RP2350 · 4 MB",
+  "board-abrobot-16m": "Abrobot RP2350 · 16 MB",
 };
 
 export function variantLabel(variant: string): string {

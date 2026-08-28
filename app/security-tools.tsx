@@ -61,7 +61,7 @@ interface SecurityToolsProps {
   externalBusy: boolean;
   operationLockRef: MutableRefObject<boolean>;
   onBusyChange: (busy: boolean) => void;
-  releaseAssetTrusted: boolean;
+  assetTrusted: boolean;
   directGitHub: boolean;
 }
 
@@ -167,7 +167,7 @@ export function SecurityTools({
   externalBusy,
   operationLockRef,
   onBusyChange,
-  releaseAssetTrusted,
+  assetTrusted,
   directGitHub,
 }: SecurityToolsProps) {
   const { toast, dismiss } = useToast();
@@ -364,8 +364,10 @@ export function SecurityTools({
 
   async function createSignedUf2(): Promise<void> {
     if (!asset || !key) return;
-    if (!releaseAssetTrusted) {
-      setError("The GitHub release attestation has not been verified in this browser.");
+    if (!assetTrusted) {
+      setError(asset.source === "release"
+        ? "The GitHub release attestation has not been verified in this browser."
+        : "The selected firmware metadata is not trusted.");
       return;
     }
     if (!beginOperation("Create signed UF2")) return;
@@ -816,10 +818,12 @@ export function SecurityTools({
           <Stack gap="md">
             <Heading level={3} size="lg">2. Create signed UF2</Heading>
             <Text size="sm" tone="muted">Create the recovery image first. The same image is reused throughout provisioning and for every restore test.</Text>
-            <Text size="sm" tone="muted">{asset?.name || "Choose a release and variant above."}</Text>
-            {asset && !releaseAssetTrusted && (
-              <Alert tone="danger" title="Release attestation is not verified">
-                Verify the selected GitHub release before you create a signed UF2.
+            <Text size="sm" tone="muted">{asset?.name || "Choose firmware and a variant above."}</Text>
+            {asset && !assetTrusted && (
+              <Alert tone="danger" title="Firmware metadata is not verified">
+                {asset.source === "release"
+                  ? "Verify the selected GitHub release before you create a signed UF2."
+                  : "Reload and select a complete preview build before you create a signed UF2."}
               </Alert>
             )}
             <Switch
@@ -847,7 +851,7 @@ export function SecurityTools({
             )}
             <Button
               startIcon={ShieldCheck}
-              disabled={!asset || !key || operationBusy || !releaseAssetTrusted}
+              disabled={!asset || !key || operationBusy || !assetTrusted}
               loading={busy && status.includes("signed")}
               onClick={createSignedUf2}
             >

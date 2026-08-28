@@ -47,6 +47,7 @@ describe("release asset parsing", () => {
   it("lists policy profiles without geometry-only variants", () => {
     const assets = ["default", "display", "16mb", "fips", "fips-pqc"].map((variant, index) => ({
       ...asset,
+      source: "release" as const,
       id: index,
       name: `rs-key-v0.4.10-${variant}.uf2`,
       tag: "v0.4.10",

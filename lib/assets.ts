@@ -1,6 +1,9 @@
 import type { FirmwareAsset } from "./releases";
 
 export function assetUrl(asset: FirmwareAsset, directGitHub = false): string {
+  const base = import.meta.env.VITE_FLASHER_API_BASE || "";
+  if (asset.source === "preview") return `${base}/api/preview-assets/${asset.id}`;
+  if (asset.source === "local") throw new Error("A local firmware file has no download URL.");
   if (directGitHub) {
     return asset.downloadUrl
       || `https://github.com/TheMaxMur/RS-Key/releases/download/${encodeURIComponent(asset.tag)}/${encodeURIComponent(asset.name)}`;
@@ -11,7 +14,6 @@ export function assetUrl(asset: FirmwareAsset, directGitHub = false): string {
     sha256: asset.sha256,
     size: String(asset.size),
   });
-  const base = import.meta.env.VITE_FLASHER_API_BASE || "";
   return `${base}/api/assets/${asset.id}?${query}`;
 }
 
@@ -57,6 +59,6 @@ export async function downloadVerifiedAsset(
   directGitHub = false,
 ): Promise<Uint8Array> {
   const bytes = await downloadAsset(asset, onProgress, directGitHub);
-  if (await sha256Hex(bytes) !== asset.sha256) throw new Error("Firmware SHA-256 does not match the GitHub release.");
+  if (await sha256Hex(bytes) !== asset.sha256) throw new Error("Firmware SHA-256 does not match its metadata.");
   return bytes;
 }

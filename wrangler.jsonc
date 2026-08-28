@@ -16,6 +16,13 @@
       "bucket_name": "rs-key-flasher-release-assets"
     }
   ],
+  "d1_databases": [
+    {
+      "binding": "PREVIEWS",
+      "database_name": "rs-key-flasher-previews",
+      "migrations_dir": "migrations"
+    }
+  ],
   "routes": [
     { "pattern": "rskey.fob.wtf", "custom_domain": true }
   ],

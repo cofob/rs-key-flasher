@@ -2,6 +2,7 @@ import handler from "vinext/server/app-router-entry";
 import { fetchReleaseAttestations } from "../lib/release-attestation";
 import { verifyReleaseAttestationServer } from "../lib/release-attestation-server";
 import type { Release, ReleaseAsset, ReleaseManifest } from "../lib/releases";
+import { cleanupPreviews, handlePreviewRequest, type PreviewEnv } from "./previews";
 
 const REPOSITORY = "TheMaxMur/RS-Key";
 const RELEASES_KEY = "releases:v2";
@@ -12,7 +13,7 @@ const MAX_ASSET_SIZE = 32 * 1024 * 1024;
 const MAX_MIRROR_ASSETS = 400;
 const MAX_MIRROR_TIME = 12 * 60 * 1000;
 
-interface Env {
+interface Env extends PreviewEnv {
   ASSETS: Fetcher;
   GITHUB_CACHE?: KVNamespace;
   RELEASE_ASSETS?: R2Bucket;
@@ -392,12 +393,16 @@ const worker = {
     const assetMatch = url.pathname.match(/^\/api\/assets\/(\d+)$/);
     if (request.method === "GET" && assetMatch) return serveAsset(request, env, ctx, Number(assetMatch[1]));
 
+    const previewResponse = await handlePreviewRequest(request, env);
+    if (previewResponse) return previewResponse;
+
     if (url.pathname.startsWith("/api/")) return json({ error: "Not found." }, { status: 404 });
     return handler.fetch(request, env, ctx);
   },
 
   async scheduled(_controller: unknown, env: Env, ctx: WorkerContext): Promise<void> {
     ctx.waitUntil(syncMirror(env));
+    ctx.waitUntil(cleanupPreviews(env));
   },
 };
 
