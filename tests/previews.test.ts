@@ -2,12 +2,55 @@ import { describe, expect, it } from "vitest";
 import { assetUrl, sha256Hex } from "../lib/assets";
 import { PREVIEW_VARIANTS, previewAssetFilename, type PreviewUploadMetadata } from "../lib/previews";
 import { encodeUf2 } from "../lib/uf2";
+import { type GitHubOidcTrust, verifyGitHubOidcToken } from "../worker/github-oidc";
 import {
   handlePreviewRequest,
   parsePreviewMetadata,
   previewR2Key,
   validatePreviewAssetBytes,
 } from "../worker/previews";
+
+const OIDC_TRUST: GitHubOidcTrust = {
+  audience: "https://rskey.fob.wtf/api/previews",
+  repositoryId: "1266469959",
+  workflowRef: "TheMaxMur/RS-Key/.github/workflows/preview-publish.yml@refs/heads/main",
+};
+
+function base64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function jsonSegment(value: unknown): string {
+  return base64Url(new TextEncoder().encode(JSON.stringify(value)));
+}
+
+async function signedOidcToken(overrides: Record<string, unknown> = {}): Promise<{ token: string; jwk: JsonWebKey }> {
+  const keys = await crypto.subtle.generateKey(
+    { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+    true,
+    ["sign", "verify"],
+  ) as CryptoKeyPair;
+  const jwk = await crypto.subtle.exportKey("jwk", keys.publicKey);
+  Object.assign(jwk, { alg: "RS256", kid: "test-key", use: "sig" });
+  const now = Math.floor(Date.now() / 1000);
+  const header = jsonSegment({ alg: "RS256", kid: "test-key", typ: "JWT" });
+  const claims = jsonSegment({
+    iss: "https://token.actions.githubusercontent.com",
+    aud: OIDC_TRUST.audience,
+    exp: now + 300,
+    nbf: now - 5,
+    iat: now - 5,
+    repository_id: OIDC_TRUST.repositoryId,
+    workflow_ref: OIDC_TRUST.workflowRef,
+    event_name: "workflow_run",
+    ...overrides,
+  });
+  const signingInput = new TextEncoder().encode(`${header}.${claims}`);
+  const signature = new Uint8Array(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", keys.privateKey, signingInput));
+  return { token: `${header}.${claims}.${base64Url(signature)}`, jwk };
+}
 
 function metadata(): PreviewUploadMetadata {
   return {
@@ -65,12 +108,37 @@ describe("preview upload contract", () => {
       .toBe(`previews/123/2/${"c".repeat(64)}-default.uf2`);
   });
 
-  it("requires the bearer token before storage access", async () => {
+  it("rejects the removed shared-token authentication before storage access", async () => {
     const response = await handlePreviewRequest(
-      new Request("https://flasher.test/api/previews", { method: "POST" }),
-      { RS_KEY_FLASHER_UPLOAD_TOKEN: "secret" },
+      new Request("https://flasher.test/api/previews", {
+        method: "POST",
+        headers: { Authorization: "Bearer old-shared-token" },
+      }),
+      {
+        GITHUB_OIDC_AUDIENCE: OIDC_TRUST.audience,
+        GITHUB_OIDC_REPOSITORY_ID: OIDC_TRUST.repositoryId,
+        GITHUB_OIDC_WORKFLOW_REF: OIDC_TRUST.workflowRef,
+      },
     );
     expect(response?.status).toBe(401);
+  });
+
+  it("verifies GitHub OIDC signature and publisher identity", async () => {
+    const valid = await signedOidcToken();
+    const loadKeys = async () => [valid.jwk];
+    await expect(verifyGitHubOidcToken(valid.token, OIDC_TRUST, loadKeys)).resolves.toBe(true);
+
+    const wrongRepository = await signedOidcToken({ repository_id: "999" });
+    await expect(verifyGitHubOidcToken(wrongRepository.token, OIDC_TRUST, async () => [wrongRepository.jwk]))
+      .resolves.toBe(false);
+    const wrongAudience = await signedOidcToken({ aud: "https://example.test/previews" });
+    await expect(verifyGitHubOidcToken(wrongAudience.token, OIDC_TRUST, async () => [wrongAudience.jwk]))
+      .resolves.toBe(false);
+    const expired = await signedOidcToken({ exp: Math.floor(Date.now() / 1000) - 120 });
+    await expect(verifyGitHubOidcToken(expired.token, OIDC_TRUST, async () => [expired.jwk]))
+      .resolves.toBe(false);
+    await expect(verifyGitHubOidcToken(valid.token, { ...OIDC_TRUST, workflowRef: "untrusted" }, loadKeys))
+      .resolves.toBe(false);
   });
 
   it("checks SHA-256, UF2 structure, and the RP2350 secure family", async () => {

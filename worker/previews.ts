@@ -9,6 +9,11 @@ import {
   type PreviewPullRequest,
   type PreviewUploadMetadata,
 } from "../lib/previews";
+import {
+  githubOidcTrustFromEnv,
+  type GitHubOidcEnv,
+  verifyGitHubOidcToken,
+} from "./github-oidc";
 
 const RP2350_ARM_SECURE = 0xe48bff59;
 const MAX_ASSET_SIZE = 32 * 1024 * 1024;
@@ -17,10 +22,9 @@ const RETENTION_SECONDS = 365 * 24 * 60 * 60;
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
 
-export interface PreviewEnv {
+export interface PreviewEnv extends GitHubOidcEnv {
   PREVIEWS?: D1Database;
   RELEASE_ASSETS?: R2Bucket;
-  RS_KEY_FLASHER_UPLOAD_TOKEN?: string;
 }
 
 interface BuildRow {
@@ -175,17 +179,6 @@ export async function validatePreviewAssetBytes(
   if (await sha256Hex(bytes) !== asset.sha256) throw new Error(`SHA-256 does not match ${asset.filename}.`);
   const image = parseUf2(bytes);
   if (image.familyId !== RP2350_ARM_SECURE) throw new Error(`${asset.filename} does not target RP2350 Arm Secure.`);
-}
-
-async function tokenMatches(actual: string | null, expected: string | undefined): Promise<boolean> {
-  if (!expected || !actual?.startsWith("Bearer ")) return false;
-  const values = [actual.slice(7), expected];
-  const digests = await Promise.all(values.map((token) => crypto.subtle.digest("SHA-256", new TextEncoder().encode(token))));
-  const left = new Uint8Array(digests[0]);
-  const right = new Uint8Array(digests[1]);
-  let difference = 0;
-  for (let index = 0; index < left.length; index++) difference |= left[index] ^ right[index];
-  return difference === 0;
 }
 
 function previewR2Key(metadata: PreviewUploadMetadata, variant: string, sha256: string): string {
@@ -370,7 +363,11 @@ async function readUpload(request: Request): Promise<{ metadata: PreviewUploadMe
 }
 
 async function uploadPreview(request: Request, env: PreviewEnv): Promise<Response> {
-  if (!await tokenMatches(request.headers.get("Authorization"), env.RS_KEY_FLASHER_UPLOAD_TOKEN)) {
+  const trust = githubOidcTrustFromEnv(env);
+  if (!trust) return invalid("Preview OIDC trust is not configured.", 503);
+  const authorization = request.headers.get("Authorization");
+  const token = authorization?.startsWith("Bearer ") ? authorization.slice(7) : "";
+  if (!token || !await verifyGitHubOidcToken(token, trust)) {
     return invalid("Unauthorized.", 401);
   }
   if (!env.PREVIEWS || !env.RELEASE_ASSETS) return invalid("Preview storage is not configured.", 503);
@@ -382,6 +379,9 @@ async function uploadPreview(request: Request, env: PreviewEnv): Promise<Respons
     return invalid(error instanceof Error ? error.message : "Invalid preview upload.");
   }
   const { metadata, files } = upload;
+  if (String(metadata.repositoryId) !== trust.repositoryId) {
+    return invalid("Preview metadata does not match the authenticated repository.");
+  }
   const buildId = `${metadata.runId}:${metadata.runAttempt}`;
   const canonical = canonicalMetadata(metadata);
   const existing = await env.PREVIEWS.prepare("SELECT * FROM preview_builds WHERE id = ?").bind(buildId).first<BuildRow>();

@@ -4,6 +4,11 @@
   "main": "./worker/index.ts",
   "compatibility_date": "2026-05-22",
   "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "GITHUB_OIDC_AUDIENCE": "https://rskey.fob.wtf/api/previews",
+    "GITHUB_OIDC_REPOSITORY_ID": "1266469959",
+    "GITHUB_OIDC_WORKFLOW_REF": "TheMaxMur/RS-Key/.github/workflows/preview-publish.yml@refs/heads/main"
+  },
   "kv_namespaces": [
     {
       "binding": "GITHUB_CACHE",
