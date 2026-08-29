@@ -7,6 +7,7 @@ import { fetchReleaseAttestations, RS_KEY_REPOSITORY_URL } from "../lib/release-
 import {
   firmwareAssets,
   releaseManifestFromGitHub,
+  resolveReleaseManifest,
   type Release,
   type ReleaseManifest,
 } from "../lib/releases";
@@ -84,36 +85,40 @@ export function Flasher() {
   const [releaseTag, setReleaseTag] = useState("");
   const [showPrereleases, setShowPrereleases] = useState(false);
   const [directGitHub, setDirectGitHub] = useState(false);
+  const [directFallback, setDirectFallback] = useState(false);
   const [attestationChecks, setAttestationChecks] = useState<Record<string, AttestationCheck>>({});
 
   useEffect(() => {
     const useDirectGitHub = localStorage.getItem(API_SOURCE_KEY) === "github";
-    Promise.resolve().then(() => setDirectGitHub(useDirectGitHub));
-    const releasesUrl = useDirectGitHub
-      ? GITHUB_RELEASES_URL
-      : `${import.meta.env.VITE_FLASHER_API_BASE || ""}/api/releases`;
     const directHeaders = { Accept: "application/vnd.github+json" };
-    fetch(releasesUrl, useDirectGitHub ? { headers: directHeaders } : undefined)
-      .then(async (response) => {
-        const body = await response.json() as unknown;
-        if (!response.ok) {
-          const message = typeof body === "object" && body && "message" in body
-            ? String(body.message)
-            : typeof body === "object" && body && "error" in body ? String(body.error) : "Could not load releases.";
-          throw new Error(message);
-        }
-        return useDirectGitHub ? releaseManifestFromGitHub(body) : body as ReleaseManifest;
-      })
-      .then(async (data) => {
-        if (!useDirectGitHub) return data;
-        const attestations = await fetchReleaseAttestations(data.releases, directHeaders);
-        return {
-          ...data,
-          releases: data.releases.map((release, index) => ({ ...release, attestation: attestations[index] })),
-        };
-      })
-      .then((data) => {
+    const fetchManifest = async (url: string, direct: boolean): Promise<ReleaseManifest> => {
+      const response = await fetch(url, direct ? { headers: directHeaders } : undefined);
+      const body = await response.json() as unknown;
+      if (!response.ok) {
+        const message = typeof body === "object" && body && "message" in body
+          ? String(body.message)
+          : typeof body === "object" && body && "error" in body ? String(body.error) : "Could not load releases.";
+        throw new Error(message);
+      }
+      return direct ? releaseManifestFromGitHub(body) : body as ReleaseManifest;
+    };
+    const loadDirect = async (): Promise<ReleaseManifest> => {
+      const data = await fetchManifest(GITHUB_RELEASES_URL, true);
+      const attestations = await fetchReleaseAttestations(data.releases, directHeaders);
+      return {
+        ...data,
+        releases: data.releases.map((release, index) => ({ ...release, attestation: attestations[index] })),
+      };
+    };
+    resolveReleaseManifest(
+      useDirectGitHub,
+      () => fetchManifest(`${import.meta.env.VITE_FLASHER_API_BASE || ""}/api/releases`, false),
+      loadDirect,
+    )
+      .then(({ manifest: data, directGitHub: resolvedDirectGitHub, directFallback: usedDirectFallback }) => {
         setAttestationChecks({});
+        setDirectGitHub(resolvedDirectGitHub);
+        setDirectFallback(usedDirectFallback);
         setManifest(data);
         const stable = data.releases.find((release) => !release.prerelease);
         setReleaseTag(stable?.tag || data.releases[0]?.tag || "");
@@ -192,6 +197,11 @@ export function Flasher() {
       officialComparisonFailed={officialComparisonFailed}
       notices={<>
         {releaseError && <Alert tone="danger" title="Releases are unavailable">{releaseError}</Alert>}
+        {directFallback && (
+          <Alert tone="warning" title="Using the Direct GitHub API">
+            The flasher API returned cached release data. Current release data was loaded directly from GitHub.
+          </Alert>
+        )}
         {manifest?.stale && (
           <Alert tone="warning" title="Using cached release data">
             GitHub is unavailable. Cached firmware remains available when it is already mirrored.

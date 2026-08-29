@@ -25,6 +25,33 @@ export interface ReleaseManifest {
   releases: Release[];
 }
 
+export interface ReleaseManifestLoadResult {
+  manifest: ReleaseManifest;
+  directGitHub: boolean;
+  directFallback: boolean;
+}
+
+export async function resolveReleaseManifest(
+  useDirectGitHub: boolean,
+  loadProxy: () => Promise<ReleaseManifest>,
+  loadDirect: () => Promise<ReleaseManifest>,
+): Promise<ReleaseManifestLoadResult> {
+  if (useDirectGitHub) {
+    return { manifest: await loadDirect(), directGitHub: true, directFallback: false };
+  }
+
+  const cachedManifest = await loadProxy();
+  if (!cachedManifest.stale) {
+    return { manifest: cachedManifest, directGitHub: false, directFallback: false };
+  }
+
+  try {
+    return { manifest: await loadDirect(), directGitHub: true, directFallback: true };
+  } catch {
+    return { manifest: cachedManifest, directGitHub: false, directFallback: false };
+  }
+}
+
 interface FirmwareAssetBase extends ReleaseAsset {
   variant: string;
   version: string;
