@@ -60,6 +60,22 @@ export function ReleaseCatalog({
       <Text size="sm" tone="muted">
         Source: <Link href={RS_KEY_REPOSITORY_URL} external>official RS-Key repository</Link>
       </Text>
+      {release?.antiRollbackEpoch && (
+        <Alert tone="warning" title="Anti-rollback floor increase recommended">
+          <Stack gap="sm">
+            {release.antiRollbackEpoch.reason && <Text>{release.antiRollbackEpoch.reason}</Text>}
+            <Text>
+              If this device already enforces anti-rollback, inspect its current OTP floor and sign this fixed
+              firmware at floor + 1. This permanently uses one of the device&apos;s 48 rollback steps.
+            </Text>
+            <Text>
+              The flasher will not change the rollback version automatically. Review the RS-Key{" "}
+              <Link href="https://themaxmur.github.io/RS-Key/anti-rollback.html" external>anti-rollback guide</Link>{" "}
+              before you continue.
+            </Text>
+          </Stack>
+        </Alert>
+      )}
       {attestation?.status === "pending" && (
         <Alert tone="warning" title="Verifying the GitHub release">
           This browser is checking the keyless release attestation.

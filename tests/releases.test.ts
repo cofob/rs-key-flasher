@@ -3,10 +3,38 @@ import {
   firmwareAssets,
   firmwareProfiles,
   findOfficialAssetBySha256,
+  parseAntiRollbackEpochMarker,
   parseFirmwareAsset,
   recommendVariant,
   releaseManifestFromGitHub,
 } from "../lib/releases";
+
+describe("anti-rollback release marker", () => {
+  it("recognizes a marker without metadata", () => {
+    expect(parseAntiRollbackEpochMarker("Release notes.\n<!-- @increase-anti-rollback-epoch -->"))
+      .toEqual({});
+  });
+
+  it("extracts and trims the optional reason", () => {
+    expect(parseAntiRollbackEpochMarker(`
+      <!--   @increase-anti-rollback-epoch   {"reason":"  Important CVE was fixed.  ","extra":true}   -->
+    `)).toEqual({ reason: "Important CVE was fixed." });
+  });
+
+  it("keeps the recommendation when its JSON metadata is invalid", () => {
+    expect(parseAntiRollbackEpochMarker(
+      '<!-- @increase-anti-rollback-epoch{"reason":"unfinished" -->',
+    )).toEqual({});
+  });
+
+  it("ignores plain text and inexact comment markers", () => {
+    expect(parseAntiRollbackEpochMarker("Use @increase-anti-rollback-epoch in a future release."))
+      .toBeUndefined();
+    expect(parseAntiRollbackEpochMarker("<!-- @increase-anti-rollback-epoch-disabled -->"))
+      .toBeUndefined();
+    expect(parseAntiRollbackEpochMarker(null)).toBeUndefined();
+  });
+});
 
 describe("release asset parsing", () => {
   const asset = {
@@ -80,6 +108,7 @@ describe("release asset parsing", () => {
       prerelease: false,
       draft: false,
       immutable: true,
+      body: '<!-- @increase-anti-rollback-epoch{"reason":"Important CVE was fixed."} -->',
       assets: [{
         id: 17,
         name: "rs-key-v0.4.10-default.uf2",
@@ -96,6 +125,8 @@ describe("release asset parsing", () => {
     }], "2026-01-02T00:00:00Z");
 
     expect(manifest).toMatchObject({ refreshedAt: "2026-01-02T00:00:00Z", stale: false });
+    expect(manifest.releases[0].antiRollbackEpoch).toEqual({ reason: "Important CVE was fixed." });
+    expect(manifest.releases[0]).not.toHaveProperty("body");
     expect(manifest.releases[0].assets).toEqual([{
       id: 17,
       name: "rs-key-v0.4.10-default.uf2",

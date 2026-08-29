@@ -8,6 +8,10 @@ export interface ReleaseAsset {
   downloadUrl?: string;
 }
 
+export interface AntiRollbackEpochRecommendation {
+  reason?: string;
+}
+
 export interface Release {
   id: number;
   tag: string;
@@ -16,6 +20,7 @@ export interface Release {
   prerelease: boolean;
   immutable: boolean;
   assets: ReleaseAsset[];
+  antiRollbackEpoch?: AntiRollbackEpochRecommendation;
   attestation?: ReleaseAttestation;
 }
 
@@ -90,32 +95,64 @@ interface GitHubRelease {
   prerelease: boolean;
   draft: boolean;
   immutable: boolean;
+  body: string | null;
   assets: GitHubAsset[];
+}
+
+const ANTI_ROLLBACK_EPOCH_MARKER = "@increase-anti-rollback-epoch";
+const HTML_COMMENT = /<!--([\s\S]*?)-->/g;
+
+export function parseAntiRollbackEpochMarker(body: unknown): AntiRollbackEpochRecommendation | undefined {
+  if (typeof body !== "string") return undefined;
+
+  for (const match of body.matchAll(HTML_COMMENT)) {
+    const comment = match[1].trim();
+    if (comment === ANTI_ROLLBACK_EPOCH_MARKER) return {};
+    if (!comment.startsWith(ANTI_ROLLBACK_EPOCH_MARKER)) continue;
+
+    const metadata = comment.slice(ANTI_ROLLBACK_EPOCH_MARKER.length).trim();
+    if (!metadata.startsWith("{")) continue;
+
+    try {
+      const parsed = JSON.parse(metadata) as unknown;
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+      const reason = "reason" in parsed && typeof parsed.reason === "string" ? parsed.reason.trim() : "";
+      return reason ? { reason } : {};
+    } catch {
+      return {};
+    }
+  }
+
+  return undefined;
 }
 
 export function releaseManifestFromGitHub(raw: unknown, refreshedAt = new Date().toISOString()): ReleaseManifest {
   if (!Array.isArray(raw)) throw new Error("GitHub returned an invalid release list.");
   const releases = (raw as GitHubRelease[]).filter((release) =>
     !release.draft && Number.isSafeInteger(release.id),
-  ).map((release): Release => ({
-    id: release.id,
-    tag: release.tag_name,
-    name: release.name || release.tag_name,
-    publishedAt: release.published_at || "",
-    prerelease: release.prerelease,
-    immutable: release.immutable === true,
-    assets: Array.isArray(release.assets) ? release.assets.flatMap((asset): ReleaseAsset[] => {
-      const sha256 = asset.digest?.match(/^sha256:([0-9a-f]{64})$/i)?.[1]?.toLowerCase();
-      if (!sha256 || !Number.isSafeInteger(asset.id) || !Number.isSafeInteger(asset.size) || asset.size <= 0) return [];
-      return [{
-        id: asset.id,
-        name: asset.name,
-        size: asset.size,
-        sha256,
-        downloadUrl: asset.browser_download_url,
-      }];
-    }) : [],
-  }));
+  ).map((release): Release => {
+    const antiRollbackEpoch = parseAntiRollbackEpochMarker(release.body);
+    return {
+      id: release.id,
+      tag: release.tag_name,
+      name: release.name || release.tag_name,
+      publishedAt: release.published_at || "",
+      prerelease: release.prerelease,
+      immutable: release.immutable === true,
+      ...(antiRollbackEpoch ? { antiRollbackEpoch } : {}),
+      assets: Array.isArray(release.assets) ? release.assets.flatMap((asset): ReleaseAsset[] => {
+        const sha256 = asset.digest?.match(/^sha256:([0-9a-f]{64})$/i)?.[1]?.toLowerCase();
+        if (!sha256 || !Number.isSafeInteger(asset.id) || !Number.isSafeInteger(asset.size) || asset.size <= 0) return [];
+        return [{
+          id: asset.id,
+          name: asset.name,
+          size: asset.size,
+          sha256,
+          downloadUrl: asset.browser_download_url,
+        }];
+      }) : [],
+    };
+  });
   return { refreshedAt, stale: false, releases };
 }
 

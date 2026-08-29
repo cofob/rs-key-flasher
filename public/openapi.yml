@@ -48,6 +48,8 @@ paths:
                         publishedAt: "2026-08-14T05:22:15Z"
                         prerelease: false
                         immutable: true
+                        antiRollbackEpoch:
+                          reason: Important security fix in this release.
                         assets:
                           - id: 513973851
                             name: rs-key-v0.4.10-default.uf2
@@ -471,6 +473,11 @@ components:
         bundle:
           type: object
           additionalProperties: true
+    AntiRollbackEpochRecommendation:
+      type: object
+      description: Advises owners of devices with anti-rollback enabled to consider raising their device floor by one.
+      properties:
+        reason: { type: string }
     Release:
       type: object
       required: [id, tag, name, publishedAt, prerelease, immutable, assets]
@@ -481,6 +488,7 @@ components:
         publishedAt: { type: string, format: date-time }
         prerelease: { type: boolean }
         immutable: { type: boolean }
+        antiRollbackEpoch: { $ref: "#/components/schemas/AntiRollbackEpochRecommendation" }
         assets:
           type: array
           items: { $ref: "#/components/schemas/ReleaseAsset" }

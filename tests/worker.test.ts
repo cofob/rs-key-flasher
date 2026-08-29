@@ -217,6 +217,42 @@ describe("Worker cache", () => {
     expect(response.status).toBe(200);
     expect(manifest.stale).toBe(true);
     expect(manifest.releases).toHaveLength(1);
+    expect(manifest.releases[0]).not.toHaveProperty("antiRollbackEpoch");
+  });
+
+  it("publishes anti-rollback metadata without the release body", async () => {
+    const kv = new MemoryKv();
+    const releaseBody = [
+      "Security release.",
+      '<!-- @increase-anti-rollback-epoch{"reason":"A downgrade-exploitable bug was fixed."} -->',
+    ].join("\n");
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json([{
+      id: 100,
+      tag_name: "v1.0.0",
+      name: "v1",
+      published_at: "2026-08-29T00:00:00Z",
+      prerelease: false,
+      draft: false,
+      immutable: true,
+      body: releaseBody,
+      assets: [{ ...asset, digest: `sha256:${asset.sha256}` }],
+    }], { headers: { ETag: "marker-release" } })));
+
+    const response = await worker.fetch(
+      new Request("https://flasher.test/api/releases"),
+      { GITHUB_CACHE: kv } as never,
+      context(),
+    );
+    const manifest = await response.json() as {
+      releases: Array<{ antiRollbackEpoch?: { reason?: string }; body?: string }>;
+    };
+
+    expect(response.status).toBe(200);
+    expect(manifest.releases[0].antiRollbackEpoch).toEqual({
+      reason: "A downgrade-exploitable bug was fixed.",
+    });
+    expect(manifest.releases[0]).not.toHaveProperty("body");
+    expect(JSON.parse(kv.values.get("releases:v2") || "{}").releases[0]).not.toHaveProperty("body");
   });
 
   it("does not publish assets when the server-side attestation check fails", async () => {
@@ -230,6 +266,7 @@ describe("Worker cache", () => {
       prerelease: false,
       draft: false,
       immutable: true,
+      body: null,
       assets: [{ ...asset, digest: `sha256:${asset.sha256}` }],
     }])));
 

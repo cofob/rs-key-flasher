@@ -1,7 +1,7 @@
 import handler from "vinext/server/app-router-entry";
 import { fetchReleaseAttestations } from "../lib/release-attestation";
 import { verifyReleaseAttestationServer } from "../lib/release-attestation-server";
-import type { Release, ReleaseAsset, ReleaseManifest } from "../lib/releases";
+import { parseAntiRollbackEpochMarker, type Release, type ReleaseAsset, type ReleaseManifest } from "../lib/releases";
 import { cleanupPreviews, handlePreviewRequest, type PreviewEnv } from "./previews";
 import { assetRedirect, listStorageObjects, parseStorageListQuery, publicAssetUrl } from "./storage";
 
@@ -57,6 +57,7 @@ interface GitHubRelease {
   prerelease: boolean;
   draft: boolean;
   immutable: boolean;
+  body: string | null;
   assets: GitHubAsset[];
 }
 
@@ -126,19 +127,23 @@ function githubHeaders(env: Env, etag?: string): Headers {
 }
 
 function sanitizeReleases(raw: GitHubRelease[]): Release[] {
-  return raw.filter((release) => !release.draft && Number.isSafeInteger(release.id)).map((release) => ({
-    id: release.id,
-    tag: release.tag_name,
-    name: release.name || release.tag_name,
-    publishedAt: release.published_at || "",
-    prerelease: release.prerelease,
-    immutable: release.immutable === true,
-    assets: release.assets.flatMap((asset): ReleaseAsset[] => {
-      const sha256 = asset.digest?.match(/^sha256:([0-9a-f]{64})$/i)?.[1]?.toLowerCase();
-      if (!sha256) return [];
-      return [{ id: asset.id, name: asset.name, size: asset.size, sha256 }];
-    }),
-  }));
+  return raw.filter((release) => !release.draft && Number.isSafeInteger(release.id)).map((release) => {
+    const antiRollbackEpoch = parseAntiRollbackEpochMarker(release.body);
+    return {
+      id: release.id,
+      tag: release.tag_name,
+      name: release.name || release.tag_name,
+      publishedAt: release.published_at || "",
+      prerelease: release.prerelease,
+      immutable: release.immutable === true,
+      ...(antiRollbackEpoch ? { antiRollbackEpoch } : {}),
+      assets: release.assets.flatMap((asset): ReleaseAsset[] => {
+        const sha256 = asset.digest?.match(/^sha256:([0-9a-f]{64})$/i)?.[1]?.toLowerCase();
+        if (!sha256) return [];
+        return [{ id: asset.id, name: asset.name, size: asset.size, sha256 }];
+      }),
+    };
+  });
 }
 
 async function readCachedReleases(env: Env): Promise<CachedReleases | null> {

@@ -18,6 +18,8 @@ describe("OpenAPI documentation", () => {
     for (const path of documentedPaths) expect(specification).toContain(`  ${path}:`);
     expect(specification).toContain('"307": { $ref: "#/components/responses/AssetRedirect" }');
     expect(specification).toContain("https://rskey-assets.cofob.dev/");
+    expect(specification).toContain("AntiRollbackEpochRecommendation:");
+    expect(specification).toContain('antiRollbackEpoch: { $ref: "#/components/schemas/AntiRollbackEpochRecommendation" }');
   });
 
   it("loads the public specification from the Swagger page", async () => {
