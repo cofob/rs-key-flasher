@@ -486,10 +486,19 @@ export async function handlePreviewRequest(request: Request, env: PreviewEnv): P
     if (request.method === "GET") return listPreviews(request, env);
     return invalid("Method not allowed.", 405);
   }
-  const buildMatch = url.pathname.match(/^\/api\/previews\/([0-9]+:[0-9]+)$/);
-  if (buildMatch && request.method === "GET") {
+  const encodedBuildMatch = url.pathname.match(/^\/api\/previews\/([^/]+)$/);
+  let buildId: string | null = null;
+  if (encodedBuildMatch) {
+    try {
+      const decoded = decodeURIComponent(encodedBuildMatch[1]);
+      if (/^[0-9]+:[0-9]+$/.test(decoded)) buildId = decoded;
+    } catch {
+      // Ignore malformed path encoding and let the general API router return 404.
+    }
+  }
+  if (buildId && request.method === "GET") {
     if (!env.PREVIEWS) return invalid("Preview storage is not configured.", 503);
-    const build = await getBuild(env.PREVIEWS, buildMatch[1]);
+    const build = await getBuild(env.PREVIEWS, buildId);
     return build ? json(build, { headers: { "Cache-Control": "public, max-age=15, s-maxage=30" } }) : invalid("Preview build not found.", 404);
   }
   const assetMatch = url.pathname.match(/^\/api\/preview-assets\/(\d+)$/);

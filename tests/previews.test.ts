@@ -123,6 +123,15 @@ describe("preview upload contract", () => {
     expect(response?.status).toBe(401);
   });
 
+  it("routes percent-encoded preview build IDs", async () => {
+    const response = await handlePreviewRequest(
+      new Request("https://flasher.test/api/previews/33266729700%3A1"),
+      {},
+    );
+    expect(response?.status).toBe(503);
+    await expect(response?.json()).resolves.toEqual({ error: "Preview storage is not configured." });
+  });
+
   it("verifies GitHub OIDC signature and publisher identity", async () => {
     const valid = await signedOidcToken();
     const loadKeys = async () => [valid.jwk];
