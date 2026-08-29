@@ -26,7 +26,7 @@ import {
   Text,
   TextField,
 } from "@cofob/design-system-react/static";
-import { CheckCircle2, Cpu, Download as DownloadIcon, ShieldCheck, Usb } from "lucide-react";
+import { Check, CheckCircle2, Cpu, Download as DownloadIcon, File, ShieldCheck, Usb } from "lucide-react";
 import { downloadVerifiedAsset, sha256Hex } from "../lib/assets";
 import { readSecureBootOtpState } from "../lib/otp";
 import { flashUf2, hasWebUsb, requestPicobootDevice, type FlashStage } from "../lib/picoboot";
@@ -69,6 +69,7 @@ export interface FirmwareWorkbenchProps {
   remoteDescription: string;
   assets: FirmwareAsset[];
   remoteTrusted: boolean;
+  remoteSelection?: "guided" | "asset-list";
   catalog: ReactNode;
   notices?: ReactNode;
   directGitHub?: boolean;
@@ -95,6 +96,10 @@ function flashPercent(stage: FlashStage, completed: number, total: number): numb
   if (stage === "write") return 50 + ratio * 25;
   if (stage === "verify") return 75 + ratio * 20;
   return 95 + ratio * 5;
+}
+
+function formatAssetSize(size: number): string {
+  return `${(size / 1024 / 1024).toFixed(2)} MB`;
 }
 
 function ThemeSwitcher() {
@@ -142,6 +147,7 @@ export function FirmwareWorkbench({
   remoteDescription,
   assets,
   remoteTrusted,
+  remoteSelection = "guided",
   catalog,
   notices,
   directGitHub = false,
@@ -193,7 +199,7 @@ export function FirmwareWorkbench({
   const effectiveManualVariant = assets.some((asset) => asset.variant === manualVariant)
     ? manualVariant
     : assets.find((asset) => asset.variant === "default")?.variant || assets[0]?.variant || "";
-  const variant = mode === "easy" ? easyVariant : effectiveManualVariant;
+  const variant = remoteSelection === "asset-list" || mode === "manual" ? effectiveManualVariant : easyVariant;
   const remoteAsset = assets.find((asset) => asset.variant === variant);
   const selectedAsset = firmwareSource === "local" ? localAsset || undefined : remoteAsset;
   const localOfficialMatch = localAsset && officialComparisonReady
@@ -405,76 +411,118 @@ export function FirmwareWorkbench({
 
                   {firmwareSource === "remote" && (
                     <Stack gap="md">
-                      <Heading level={2} size="lg">2. Choose a device</Heading>
-                      <RadioGroup name="selection-mode" label="Selection mode" orientation="horizontal" disabled={operationBusy}>
-                        <Radio
-                          name="selection-mode"
-                          value="easy"
-                          label="Easy picker"
-                          description="Answer three questions"
-                          checked={mode === "easy"}
-                          onChange={() => setMode("easy")}
-                        />
-                        <Radio
-                          name="selection-mode"
-                          value="manual"
-                          label="All variants"
-                          description="Choose the firmware file"
-                          checked={mode === "manual"}
-                          onChange={() => setMode("manual")}
-                        />
-                      </RadioGroup>
-
-                      {mode === "easy" ? (
-                        <Stack gap="md" className="picker-questions">
-                          <Switch
-                            label="Waveshare RP2350-Touch-LCD-2.8 display"
-                            description="Select this for the 2.8-inch touch-display board. It uses the 16 MB display image."
-                            checked={display}
-                            disabled={operationBusy}
-                            onChange={(event) => {
-                              setDisplay(event.target.checked);
-                              if (event.target.checked) {
-                                setFlashSize("16");
-                                setProfile("default");
-                              }
-                            }}
-                          />
-                          <Select
-                            label="Flash memory"
-                            hint={display ? "The Waveshare display board uses 16 MB." : "Check the board product page if you are not sure."}
-                            value={flashSize}
-                            disabled={display || operationBusy}
-                            onChange={(event) => {
-                              setFlashSize(event.target.value);
-                              if (event.target.value !== "4") setProfile("default");
-                            }}
-                          >
-                            <option value="2">2 MB</option>
-                            <option value="4">4 MB</option>
-                            <option value="16">16 MB</option>
-                          </Select>
-                          <Select
-                            label="Firmware profile"
-                            hint={display || flashSize !== "4" ? "Extra policy profiles use the 4 MB layout." : "Choose the security and algorithm policy."}
-                            value={effectiveProfile}
-                            disabled={display || flashSize !== "4" || !profiles.length || operationBusy}
-                            onChange={(event) => setProfile(event.target.value)}
-                          >
-                            {profiles.map((item) => <option key={item} value={item}>{variantLabel(item)}</option>)}
-                          </Select>
-                        </Stack>
+                      <Heading level={2} size="lg">
+                        {remoteSelection === "asset-list" ? "2. Choose a firmware asset" : "2. Choose a device"}
+                      </Heading>
+                      {remoteSelection === "asset-list" ? (
+                        assets.length ? (
+                          <ul className="firmware-asset-list" aria-label="Firmware assets">
+                            {assets.map((asset) => {
+                              const selected = asset.variant === effectiveManualVariant;
+                              return (
+                                <li
+                                  key={`${asset.source}-${asset.id}`}
+                                  className="firmware-asset"
+                                  data-selected={selected}
+                                >
+                                  <File aria-hidden size={20} className="firmware-asset__icon" />
+                                  <div className="firmware-asset__details">
+                                    <Text as="span" className="filename"><strong>{asset.name}</strong></Text>
+                                    <Text as="span" size="sm" tone="muted">
+                                      {variantLabel(asset.variant)} · {formatAssetSize(asset.size)}
+                                    </Text>
+                                  </div>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant={selected ? "primary" : "secondary"}
+                                    startIcon={selected ? Check : undefined}
+                                    aria-pressed={selected}
+                                    disabled={operationBusy}
+                                    onClick={() => setManualVariant(asset.variant)}
+                                  >
+                                    {selected ? "Selected" : "Select"}
+                                  </Button>
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        ) : (
+                          <Text tone="muted">Choose a preview build to see its firmware assets.</Text>
+                        )
                       ) : (
-                        <Select
-                          label="Firmware variant"
-                          value={effectiveManualVariant}
-                          disabled={!assets.length || operationBusy}
-                          onChange={(event) => setManualVariant(event.target.value)}
-                        >
-                          {assets.map((asset) => (
-                            <option key={`${asset.source}-${asset.id}`} value={asset.variant}>{variantLabel(asset.variant)}</option>
-                          ))}
-                        </Select>
+                        <>
+                          <RadioGroup name="selection-mode" label="Selection mode" orientation="horizontal" disabled={operationBusy}>
+                            <Radio
+                              name="selection-mode"
+                              value="easy"
+                              label="Easy picker"
+                              description="Answer three questions"
+                              checked={mode === "easy"}
+                              onChange={() => setMode("easy")}
+                            />
+                            <Radio
+                              name="selection-mode"
+                              value="manual"
+                              label="All variants"
+                              description="Choose the firmware file"
+                              checked={mode === "manual"}
+                              onChange={() => setMode("manual")}
+                            />
+                          </RadioGroup>
+
+                          {mode === "easy" ? (
+                            <Stack gap="md" className="picker-questions">
+                              <Switch
+                                label="Waveshare RP2350-Touch-LCD-2.8 display"
+                                description="Select this for the 2.8-inch touch-display board. It uses the 16 MB display image."
+                                checked={display}
+                                disabled={operationBusy}
+                                onChange={(event) => {
+                                  setDisplay(event.target.checked);
+                                  if (event.target.checked) {
+                                    setFlashSize("16");
+                                    setProfile("default");
+                                  }
+                                }}
+                              />
+                              <Select
+                                label="Flash memory"
+                                hint={display ? "The Waveshare display board uses 16 MB." : "Check the board product page if you are not sure."}
+                                value={flashSize}
+                                disabled={display || operationBusy}
+                                onChange={(event) => {
+                                  setFlashSize(event.target.value);
+                                  if (event.target.value !== "4") setProfile("default");
+                                }}
+                              >
+                                <option value="2">2 MB</option>
+                                <option value="4">4 MB</option>
+                                <option value="16">16 MB</option>
+                              </Select>
+                              <Select
+                                label="Firmware profile"
+                                hint={display || flashSize !== "4" ? "Extra policy profiles use the 4 MB layout." : "Choose the security and algorithm policy."}
+                                value={effectiveProfile}
+                                disabled={display || flashSize !== "4" || !profiles.length || operationBusy}
+                                onChange={(event) => setProfile(event.target.value)}
+                              >
+                                {profiles.map((item) => <option key={item} value={item}>{variantLabel(item)}</option>)}
+                              </Select>
+                            </Stack>
+                          ) : (
+                            <Select
+                              label="Firmware variant"
+                              value={effectiveManualVariant}
+                              disabled={!assets.length || operationBusy}
+                              onChange={(event) => setManualVariant(event.target.value)}
+                            >
+                              {assets.map((asset) => (
+                                <option key={`${asset.source}-${asset.id}`} value={asset.variant}>{variantLabel(asset.variant)}</option>
+                              ))}
+                            </Select>
+                          )}
+                        </>
                       )}
                     </Stack>
                   )}

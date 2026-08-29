@@ -43,6 +43,41 @@ body {
   padding-left: var(--cf-space-5);
 }
 
+.firmware-asset-list {
+  border: 1px solid var(--cf-color-border);
+  border-radius: var(--cf-radius-lg);
+  list-style: none;
+  margin: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
+.firmware-asset {
+  align-items: center;
+  display: grid;
+  gap: var(--cf-space-3);
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  padding: var(--cf-space-3) var(--cf-space-4);
+}
+
+.firmware-asset + .firmware-asset {
+  border-top: 1px solid var(--cf-color-border);
+}
+
+.firmware-asset[data-selected="true"] {
+  background: var(--cf-color-accent-soft);
+}
+
+.firmware-asset__icon {
+  color: var(--cf-color-text-muted);
+}
+
+.firmware-asset__details {
+  display: grid;
+  gap: var(--cf-space-1);
+  min-width: 0;
+}
+
 .recommendation {
   background: var(--cf-color-success-surface);
   border: 1px solid var(--cf-color-success-border);
@@ -251,6 +286,16 @@ body {
 
   .preview-filter-grid {
     grid-template-columns: 1fr;
+  }
+
+  .firmware-asset {
+    align-items: start;
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .firmware-asset .cf-button {
+    grid-column: 2;
+    justify-self: start;
   }
 
   .security-grid {

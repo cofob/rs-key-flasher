@@ -348,6 +348,7 @@ export function PreviewFlasher() {
       remoteDescription="Choose a successful CI build"
       assets={assets}
       remoteTrusted={Boolean(selected && selected.assets.length === 20)}
+      remoteSelection="asset-list"
       notices={(
         <Alert tone="warning" title="Preview firmware is experimental">
           Preview builds contain unmerged or recently changed code. They are not official releases and can be broken. Check the pull request and commit before you use them.
