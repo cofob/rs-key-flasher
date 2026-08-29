@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { assetUrl, sha256Hex } from "../lib/assets";
 import { PREVIEW_VARIANTS, previewAssetFilename, type PreviewUploadMetadata } from "../lib/previews";
 import { encodeUf2 } from "../lib/uf2";
@@ -6,7 +6,7 @@ import { type GitHubOidcTrust, verifyGitHubOidcToken } from "../worker/github-oi
 import {
   handlePreviewRequest,
   parsePreviewMetadata,
-  previewR2Key,
+  previewStorageKey,
   validatePreviewAssetBytes,
 } from "../worker/previews";
 
@@ -103,8 +103,8 @@ describe("preview upload contract", () => {
     expect(() => parsePreviewMetadata(withNoTouch)).toThrow("Invalid preview asset metadata");
   });
 
-  it("uses deterministic R2 paths", () => {
-    expect(previewR2Key(metadata(), "default", "c".repeat(64)))
+  it("uses deterministic storage paths", () => {
+    expect(previewStorageKey(metadata(), "default", "c".repeat(64)))
       .toBe(`previews/123/2/${"c".repeat(64)}-default.uf2`);
   });
 
@@ -185,5 +185,104 @@ describe("preview upload contract", () => {
       variant: "default",
       version: "aaaaaaaaaaaa",
     })).toBe("/api/preview-assets/77");
+  });
+
+  it("redirects a ready preview asset without a storage metadata check", async () => {
+    const row = {
+      id: 77,
+      build_id: "123:2",
+      variant: "default",
+      filename: "firmware-default.uf2",
+      size: 512,
+      sha256: "b".repeat(64),
+      r2_key: `previews/123/2/${"b".repeat(64)}-default.uf2`,
+    };
+    const database = {
+      prepare: () => ({ bind: () => ({ first: async () => row }) }),
+    };
+    const bucket = {
+      head: vi.fn(),
+    };
+
+    const response = await handlePreviewRequest(
+      new Request("https://flasher.test/api/preview-assets/77"),
+      { PREVIEWS: database, RELEASE_ASSETS: bucket, ASSET_PUBLIC_BASE_URL: "https://assets.test" } as never,
+    );
+
+    expect(response?.status).toBe(307);
+    expect(response?.headers.get("Location"))
+      .toBe(`https://assets.test/previews/123/2/${"b".repeat(64)}-default.uf2`);
+    expect(bucket.head).not.toHaveBeenCalled();
+  });
+
+  it("returns only public database-linked objects from preview inventory", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const object = (key: string) => ({
+      key,
+      version: "v1",
+      size: 512,
+      etag: "etag",
+      uploaded: new Date("2026-08-29T12:00:00.000Z"),
+      storageClass: "Standard",
+      checksums: {},
+      httpMetadata: { contentType: "application/octet-stream" },
+      customMetadata: { sha256: "b".repeat(64) },
+    });
+    const publicKey = `previews/123/2/${"b".repeat(64)}-default.uf2`;
+    const orphanKey = "previews/999/1/orphan.uf2";
+    const bucket = {
+      list: async () => ({ objects: [object(publicKey), object(orphanKey)], truncated: false }),
+    };
+    const joinedRow = {
+      id: "123:2",
+      run_id: 123,
+      run_attempt: 2,
+      event: "pull_request",
+      status: "ready",
+      commit_sha: "a".repeat(40),
+      branch: "preview/api",
+      actor: "contributor",
+      run_url: "https://github.com/TheMaxMur/RS-Key/actions/runs/123",
+      repository: "TheMaxMur/RS-Key",
+      source_repository: "contributor/RS-Key",
+      metadata_json: "private raw metadata",
+      created_at: now - 60,
+      published_at: now,
+      expires_at: now + 3600,
+      error: "private error",
+      asset_count: 1,
+      asset_id: 77,
+      asset_build_id: "123:2",
+      asset_variant: "default",
+      asset_filename: "firmware-default.uf2",
+      asset_size: 512,
+      asset_sha256: "b".repeat(64),
+      asset_storage_key: publicKey,
+    };
+    const database = {
+      prepare: (sql: string) => ({
+        bind: () => ({
+          all: async () => sql.includes("FROM preview_build_prs")
+            ? { results: [] }
+            : { results: [joinedRow] },
+        }),
+      }),
+    };
+
+    const response = await handlePreviewRequest(
+      new Request("https://flasher.test/api/storage/previews?limit=2"),
+      { PREVIEWS: database, RELEASE_ASSETS: bucket, ASSET_PUBLIC_BASE_URL: "https://assets.test" } as never,
+    );
+    const body = await response?.json() as { items: Array<Record<string, unknown>> };
+
+    expect(response?.status).toBe(200);
+    expect(body.items).toHaveLength(1);
+    expect(JSON.stringify(body)).not.toContain("private raw metadata");
+    expect(JSON.stringify(body)).not.toContain("private error");
+    expect(body.items[0]).toMatchObject({
+      object: { key: publicKey },
+      asset: { id: 77, storageKey: publicKey },
+      build: { id: "123:2", status: "ready" },
+    });
   });
 });

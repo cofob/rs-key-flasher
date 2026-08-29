@@ -28,12 +28,21 @@ npm run typecheck
 npm run build
 ```
 
-Preview storage uses the `PREVIEWS` D1 binding and the existing `RELEASE_ASSETS` R2 bucket. Create the D1 database, add its ID to `wrangler.jsonc`, and apply migrations:
+Preview storage uses the `PREVIEWS` database binding and the existing `RELEASE_ASSETS` object-storage binding. Create the database, add its ID to `wrangler.jsonc`, and apply migrations:
 
 ```sh
 wrangler d1 create rs-key-flasher-previews
 wrangler d1 migrations apply rs-key-flasher-previews --remote
 ```
+
+Asset download endpoints redirect to the public storage domain configured by `ASSET_PUBLIC_BASE_URL`. Apply the read-only CORS policy before deploying redirect support, then verify it:
+
+```sh
+npx wrangler r2 bucket cors set rs-key-flasher-release-assets --file asset-storage-cors.json
+npx wrangler r2 bucket cors list rs-key-flasher-release-assets
+```
+
+If the public domain already cached objects before the policy was applied, purge that hostname so that responses include the new CORS headers.
 
 The privileged `preview-publish` workflow authenticates with a short-lived GitHub Actions OIDC token. The Worker verifies GitHub's signature, the dedicated audience, the immutable RS-Key repository ID, and the publisher workflow ref on `main`. Preview publishing does not use a shared secret.
 

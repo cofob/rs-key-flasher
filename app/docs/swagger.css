@@ -1,0 +1,16 @@
+.swagger-docs {
+  min-height: 100vh;
+  overflow: auto;
+  background: #ffffff;
+  color: #3b4151;
+  color-scheme: light;
+}
+
+.swagger-docs .swagger-ui,
+.swagger-docs .swagger-ui :is(input, select, textarea, button) {
+  color-scheme: light;
+}
+
+.swagger-docs .swagger-ui .scheme-container {
+  background: #ffffff;
+}

@@ -5,6 +5,7 @@
   "compatibility_date": "2026-05-22",
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
+    "ASSET_PUBLIC_BASE_URL": "https://rskey-assets.cofob.dev",
     "GITHUB_OIDC_AUDIENCE": "https://rskey.fob.wtf/api/previews",
     "GITHUB_OIDC_REPOSITORY_ID": "1266469959",
     "GITHUB_OIDC_WORKFLOW_REF": "TheMaxMur/RS-Key/.github/workflows/preview-publish.yml@refs/heads/main"

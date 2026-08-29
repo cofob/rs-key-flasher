@@ -3,6 +3,7 @@ import { fetchReleaseAttestations } from "../lib/release-attestation";
 import { verifyReleaseAttestationServer } from "../lib/release-attestation-server";
 import type { Release, ReleaseAsset, ReleaseManifest } from "../lib/releases";
 import { cleanupPreviews, handlePreviewRequest, type PreviewEnv } from "./previews";
+import { assetRedirect, listStorageObjects, parseStorageListQuery, publicAssetUrl } from "./storage";
 
 const REPOSITORY = "TheMaxMur/RS-Key";
 const RELEASES_KEY = "releases:v2";
@@ -17,6 +18,7 @@ interface Env extends PreviewEnv {
   ASSETS: Fetcher;
   GITHUB_CACHE?: KVNamespace;
   RELEASE_ASSETS?: R2Bucket;
+  ASSET_PUBLIC_BASE_URL?: string;
   GITHUB_TOKEN?: string;
 }
 
@@ -80,33 +82,35 @@ function edgeHit(response: Response): Response {
 
 function cacheResponse(ctx: WorkerContext, key: Request, response: Response): void {
   const cache = defaultEdgeCache();
-  if (!cache || !response.ok) return;
+  if (!cache || (!response.ok && response.status !== 307)) return;
   ctx.waitUntil(cache.put(key, response.clone()).catch(() => undefined));
+}
+
+function apiCacheKey(request: Request): Request {
+  const url = new URL(request.url);
+  url.searchParams.sort();
+  return new Request(url.toString(), { method: "GET" });
+}
+
+async function cachedApiResponse(
+  request: Request,
+  ctx: WorkerContext,
+  load: () => Promise<Response>,
+): Promise<Response> {
+  const key = apiCacheKey(request);
+  const cached = await defaultEdgeCache()?.match(key);
+  if (cached) return edgeHit(cached);
+  const response = await load();
+  if ((response.ok || response.status === 307) && !response.headers.has("X-RS-Key-Cache")) {
+    response.headers.set("X-RS-Key-Cache", "MISS");
+  }
+  cacheResponse(ctx, key, response);
+  return response;
 }
 
 function releasesCacheKey(request: Request): Request {
   const url = new URL(request.url);
   url.search = "";
-  return new Request(url.toString(), { method: "GET" });
-}
-
-function assetCacheKey(
-  request: Request,
-  assetId: number,
-  tag: string,
-  name: string,
-  size: number,
-  sha256: string,
-): Request {
-  const url = new URL(request.url);
-  url.search = new URLSearchParams({
-    attestation: "github-release-v1",
-    tag,
-    name,
-    sha256,
-    size: String(size),
-  }).toString();
-  url.pathname = `/api/assets/${assetId}`;
   return new Request(url.toString(), { method: "GET" });
 }
 
@@ -206,7 +210,7 @@ function contentDisposition(name: string): string {
   return `attachment; filename="${name}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
-function r2Key(tag: string, name: string): string {
+function releaseStorageKey(tag: string, name: string): string {
   return `releases/${tag}/${name}`;
 }
 
@@ -218,19 +222,6 @@ function hashBytes(hex: string): ArrayBuffer {
   const bytes = new Uint8Array(hex.length / 2);
   for (let index = 0; index < bytes.length; index++) bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
   return bytes.buffer;
-}
-
-function assetHeaders(name: string, size: number, cache: string): Headers {
-  return new Headers({
-    "Cache-Tag": "rs-key-release-assets",
-    "Cache-Control": "public, max-age=31536000, immutable",
-    "Cloudflare-CDN-Cache-Control": "public, max-age=31536000, immutable",
-    "Content-Disposition": contentDisposition(name),
-    "Content-Length": String(size),
-    "Content-Type": "application/octet-stream",
-    "X-Content-Type-Options": "nosniff",
-    "X-RS-Key-Cache": cache,
-  });
 }
 
 async function fetchAsset(tag: string, name: string, size: number): Promise<Response> {
@@ -247,7 +238,7 @@ function findAsset(releases: Release[], id: number, tag: string, name: string, s
   return Boolean(release?.attestation && asset && asset.name === name && asset.size === size && asset.sha256 === sha256);
 }
 
-async function serveAsset(request: Request, env: Env, ctx: WorkerContext, assetId: number): Promise<Response> {
+async function serveAsset(request: Request, env: Env, assetId: number): Promise<Response> {
   const url = new URL(request.url);
   const tag = url.searchParams.get("tag") || "";
   const name = url.searchParams.get("name") || "";
@@ -259,44 +250,28 @@ async function serveAsset(request: Request, env: Env, ctx: WorkerContext, assetI
     return json({ error: "Invalid asset request." }, { status: 400 });
   }
 
-  const edgeKey = assetCacheKey(request, assetId, tag, name, size, sha256);
-  const edgeCached = await defaultEdgeCache()?.match(edgeKey);
-  if (edgeCached) return edgeHit(edgeCached);
-
-  let manifest = await readCachedReleases(env);
-  if (!manifest) {
-    try {
-      manifest = (await getReleases(env)).value;
-    } catch (error) {
-      return json({ error: error instanceof Error ? error.message : "Release attestation is unavailable." }, { status: 502 });
-    }
-  }
-  if (!findAsset(manifest.releases, assetId, tag, name, size, sha256)) {
-    return json({ error: "Asset is not present in the cached RS-Key release manifest." }, { status: 404 });
+  if (!env.RELEASE_ASSETS || !publicAssetUrl(env.ASSET_PUBLIC_BASE_URL, releaseStorageKey(tag, name))) {
+    return json({ error: "Public asset storage is not configured." }, { status: 503 });
   }
 
-  const key = r2Key(tag, name);
-  const cached = await env.RELEASE_ASSETS?.get(key);
-  if (cached && cached.size === size && cached.customMetadata?.sha256 === sha256) {
-    const headers = assetHeaders(name, size, "R2-HIT");
-    headers.set("ETag", cached.httpEtag);
-    const response = new Response(cached.body, { headers });
-    cacheResponse(ctx, edgeKey, response);
+  const key = releaseStorageKey(tag, name);
+  const cached = await env.RELEASE_ASSETS.head(key);
+  if (cached) {
+    const response = assetRedirect(env.ASSET_PUBLIC_BASE_URL, key, "public, max-age=31536000, immutable")!;
+    response.headers.set("X-RS-Key-Cache", "STORAGE-HIT");
     return response;
   }
 
   try {
-    const origin = await fetchAsset(tag, name, size);
-    const headers = assetHeaders(name, size, env.RELEASE_ASSETS ? "R2-MISS" : "PROXY");
-    if (!env.RELEASE_ASSETS) {
-      const response = new Response(origin.body, { headers });
-      cacheResponse(ctx, edgeKey, response);
-      return response;
+    let manifest = await readCachedReleases(env);
+    if (!manifest) manifest = (await getReleases(env)).value;
+    if (!findAsset(manifest.releases, assetId, tag, name, size, sha256)) {
+      return json({ error: "Asset is not present in the cached RS-Key release manifest." }, { status: 404 });
     }
 
-    const cacheBody = origin.clone().body;
-    if (!cacheBody) throw new Error("GitHub asset stream is missing.");
-    const cacheWrite = env.RELEASE_ASSETS.put(key, cacheBody, {
+    const origin = await fetchAsset(tag, name, size);
+    if (!origin.body) throw new Error("GitHub asset stream is missing.");
+    await env.RELEASE_ASSETS.put(key, origin.body, {
       sha256: hashBytes(sha256),
       httpMetadata: {
         contentType: "application/octet-stream",
@@ -304,19 +279,60 @@ async function serveAsset(request: Request, env: Env, ctx: WorkerContext, assetI
         cacheControl: "public, max-age=31536000, immutable",
       },
       customMetadata: { assetId: String(assetId), filename: name, sha256, tag },
-    }).then(() => undefined).catch((error: unknown) => console.error("R2 lazy write failed", error));
-    ctx.waitUntil(cacheWrite);
-    const response = new Response(origin.body, { headers });
-    cacheResponse(ctx, edgeKey, response);
+    });
+    const response = assetRedirect(env.ASSET_PUBLIC_BASE_URL, key, "public, max-age=31536000, immutable")!;
+    response.headers.set("X-RS-Key-Cache", "STORAGE-MISS");
     return response;
   } catch (error) {
     return json({ error: error instanceof Error ? error.message : "Asset download failed." }, { status: 502 });
   }
 }
 
+async function listReleaseStorage(request: Request, env: Env): Promise<Response> {
+  if (!env.RELEASE_ASSETS || !publicAssetUrl(env.ASSET_PUBLIC_BASE_URL, "releases/test")) {
+    return json({ error: "Public asset storage is not configured." }, { status: 503 });
+  }
+  const url = new URL(request.url);
+  const query = parseStorageListQuery(url);
+  const tag = (url.searchParams.get("tag") || "").trim();
+  if (!query || (tag && !safeTag(tag))) return json({ error: "Invalid storage inventory query." }, { status: 400 });
+
+  try {
+    const listed = await listStorageObjects(
+      env.RELEASE_ASSETS,
+      env.ASSET_PUBLIC_BASE_URL!,
+      tag ? `releases/${tag}/` : "releases/",
+      query,
+    );
+    const manifest = await readCachedReleases(env);
+    const releases = manifest?.releases || [];
+    const items = listed.objects.map((object) => {
+      const match = releases.flatMap((release) => release.assets.map((asset) => ({ release, asset })))
+        .find(({ release, asset }) => releaseStorageKey(release.tag, asset.name) === object.key);
+      return {
+        object,
+        releaseAsset: match ? {
+          releaseId: match.release.id,
+          tag: match.release.tag,
+          releaseName: match.release.name,
+          publishedAt: match.release.publishedAt,
+          prerelease: match.release.prerelease,
+          immutable: match.release.immutable,
+          asset: match.asset,
+        } : null,
+      };
+    });
+    return json({ items, nextCursor: listed.nextCursor }, {
+      headers: { "Cache-Control": "public, max-age=15, s-maxage=30" },
+    });
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : "Storage inventory is unavailable." }, { status: 502 });
+  }
+}
+
 async function mirrorAsset(env: Env, tag: string, asset: ReleaseAsset): Promise<void> {
   if (!env.RELEASE_ASSETS) return;
-  const key = r2Key(tag, asset.name);
+  const key = releaseStorageKey(tag, asset.name);
   const current = await env.RELEASE_ASSETS.head(key);
   if (current && current.size === asset.size && current.customMetadata?.sha256 === asset.sha256) return;
 
@@ -391,7 +407,24 @@ const worker = {
     }
 
     const assetMatch = url.pathname.match(/^\/api\/assets\/(\d+)$/);
-    if (request.method === "GET" && assetMatch) return serveAsset(request, env, ctx, Number(assetMatch[1]));
+    if (request.method === "GET" && assetMatch) {
+      return cachedApiResponse(request, ctx, () => serveAsset(request, env, Number(assetMatch[1])));
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/storage/releases") {
+      return cachedApiResponse(request, ctx, () => listReleaseStorage(request, env));
+    }
+
+    const cacheablePreviewPath = request.method === "GET" && (
+      url.pathname === "/api/previews" ||
+      /^\/api\/previews\/[^/]+$/.test(url.pathname) ||
+      /^\/api\/preview-assets\/\d+$/.test(url.pathname) ||
+      url.pathname === "/api/storage/previews"
+    );
+    if (cacheablePreviewPath) {
+      return cachedApiResponse(request, ctx, async () =>
+        await handlePreviewRequest(request, env) || json({ error: "Not found." }, { status: 404 }));
+    }
 
     const previewResponse = await handlePreviewRequest(request, env);
     if (previewResponse) return previewResponse;
@@ -406,5 +439,5 @@ const worker = {
   },
 };
 
-export { getReleases, r2Key, syncMirror };
+export { getReleases, releaseStorageKey, syncMirror };
 export default worker;

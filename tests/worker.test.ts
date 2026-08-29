@@ -16,7 +16,7 @@ vi.mock("../lib/release-attestation-server", () => ({
   verifyReleaseAttestationServer: vi.fn(),
 }));
 
-import worker, { r2Key, syncMirror } from "../worker/index";
+import worker, { releaseStorageKey, syncMirror } from "../worker/index";
 import { verifyReleaseAttestationServer } from "../lib/release-attestation-server";
 
 class MemoryKv {
@@ -119,20 +119,16 @@ describe("Worker cache", () => {
     expect(edge.values).toHaveLength(1);
   });
 
-  it("serves a verified R2 asset from the Cloudflare edge cache", async () => {
+  it("redirects a stored asset without validating its manifest or metadata", async () => {
     const kv = new MemoryKv();
-    kv.values.set("releases:v2", JSON.stringify({
-      refreshedAt: Date.now(),
-      releases: [cachedRelease()],
-    }));
+    const kvGet = vi.spyOn(kv, "get");
     const edge = new MemoryEdgeCache();
     vi.stubGlobal("caches", { default: edge });
-    const r2 = {
-      get: vi.fn(async () => ({
-        size: asset.size,
-        customMetadata: { sha256: asset.sha256 },
+    const storage = {
+      head: vi.fn(async () => ({
+        size: asset.size + 1,
+        customMetadata: { sha256: "0".repeat(64) },
         httpEtag: "test-etag",
-        body: new Response("firmware").body,
       })),
     };
     const query = new URLSearchParams({
@@ -145,25 +141,27 @@ describe("Worker cache", () => {
     const firstContext = context();
     const first = await worker.fetch(
       new Request(`https://flasher.test/api/assets/${asset.id}?${query}`),
-      { GITHUB_CACHE: kv, RELEASE_ASSETS: r2 } as never,
+      { GITHUB_CACHE: kv, RELEASE_ASSETS: storage, ASSET_PUBLIC_BASE_URL: "https://assets.test" } as never,
       firstContext,
     );
-    expect(await first.text()).toBe("firmware");
+    expect(first.status).toBe(307);
+    expect(first.headers.get("Location")).toBe(`https://assets.test/releases/v1.0.0/${asset.name}`);
+    expect(first.headers.get("X-RS-Key-Cache")).toBe("STORAGE-HIT");
+    expect(kvGet).not.toHaveBeenCalled();
+    expect(await first.text()).toBe("");
     await Promise.all(firstContext.pending);
 
     const second = await worker.fetch(
       new Request(`https://flasher.test/api/assets/${asset.id}?${query}`),
-      { GITHUB_CACHE: kv, RELEASE_ASSETS: r2 } as never,
+      { GITHUB_CACHE: kv, RELEASE_ASSETS: storage, ASSET_PUBLIC_BASE_URL: "https://assets.test" } as never,
       context(),
     );
-
-    expect(await second.text()).toBe("firmware");
+    expect(second.status).toBe(307);
     expect(second.headers.get("X-RS-Key-Cache")).toBe("EDGE-HIT");
-    expect(second.headers.get("Cache-Tag")).toBe("rs-key-release-assets");
-    expect(r2.get).toHaveBeenCalledTimes(1);
+    expect(storage.head).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the original filename in the R2 key and response", async () => {
+  it("keeps the original filename in the storage key and response", async () => {
     const kv = new MemoryKv();
     kv.values.set("releases:v2", JSON.stringify({
       refreshedAt: Date.now(),
@@ -171,8 +169,7 @@ describe("Worker cache", () => {
     }));
 
     const writes: Array<{ key: string; bytes: Uint8Array; options: unknown }> = [];
-    const r2 = {
-      get: vi.fn(async () => null),
+    const storage = {
       head: vi.fn(async () => null),
       put: vi.fn(async (key: string, body: ReadableStream<Uint8Array>, options: unknown) => {
         writes.push({ key, bytes: new Uint8Array(await new Response(body).arrayBuffer()), options });
@@ -192,16 +189,14 @@ describe("Worker cache", () => {
     });
     const response = await worker.fetch(
       new Request(`https://flasher.test/api/assets/${asset.id}?${query}`),
-      { GITHUB_CACHE: kv, RELEASE_ASSETS: r2 } as never,
+      { GITHUB_CACHE: kv, RELEASE_ASSETS: storage, ASSET_PUBLIC_BASE_URL: "https://assets.test" } as never,
       ctx,
     );
-    const clientBytes = new Uint8Array(await response.arrayBuffer());
-    await Promise.all(ctx.pending);
 
-    expect(new TextDecoder().decode(clientBytes)).toBe("firmware");
+    expect(response.status).toBe(307);
+    expect(response.headers.get("Location")).toBe(`https://assets.test/releases/v1.0.0/${asset.name}`);
     expect(writes[0].key).toBe(`releases/v1.0.0/${asset.name}`);
-    expect(response.headers.get("Content-Disposition")).toContain(asset.name);
-    expect(response.headers.get("X-RS-Key-Cache")).toBe("R2-MISS");
+    expect(response.headers.get("X-RS-Key-Cache")).toBe("STORAGE-MISS");
   });
 
   it("serves stale KV metadata when GitHub is down", async () => {
@@ -249,9 +244,68 @@ describe("Worker cache", () => {
     expect(kv.values.has("releases:v2")).toBe(false);
   });
 
-  it("uses the release tag and exact filename for R2 paths", () => {
-    expect(r2Key("v0.4.10", "rs-key-v0.4.10-display.uf2"))
+  it("uses the release tag and exact filename for storage paths", () => {
+    expect(releaseStorageKey("v0.4.10", "rs-key-v0.4.10-display.uf2"))
       .toBe("releases/v0.4.10/rs-key-v0.4.10-display.uf2");
+  });
+
+  it("lists release storage metadata and keeps unmatched objects", async () => {
+    const kv = new MemoryKv();
+    kv.values.set("releases:v2", JSON.stringify({
+      refreshedAt: Date.now(),
+      releases: [cachedRelease()],
+    }));
+    const object = (key: string) => ({
+      key,
+      version: "version-1",
+      size: asset.size,
+      etag: "etag-1",
+      uploaded: new Date("2026-08-29T12:00:00.000Z"),
+      storageClass: "Standard",
+      checksums: {},
+      httpMetadata: { contentType: "application/octet-stream" },
+      customMetadata: { sha256: asset.sha256 },
+    });
+    const matchedKey = `releases/v1.0.0/${asset.name}`;
+    const bucket = {
+      list: vi.fn(async () => ({
+        objects: [object(matchedKey), object("releases/orphan/file.uf2")],
+        truncated: true,
+        cursor: "next-page",
+      })),
+    };
+    const edge = new MemoryEdgeCache();
+    vi.stubGlobal("caches", { default: edge });
+    const firstContext = context();
+
+    const response = await worker.fetch(
+      new Request("https://flasher.test/api/storage/releases?limit=2"),
+      { GITHUB_CACHE: kv, RELEASE_ASSETS: bucket, ASSET_PUBLIC_BASE_URL: "https://assets.test" } as never,
+      firstContext,
+    );
+    const body = await response.json() as {
+      items: Array<{ object: { key: string }; releaseAsset: unknown }>;
+      nextCursor: string | null;
+    };
+
+    expect(response.status).toBe(200);
+    expect(bucket.list).toHaveBeenCalledWith(expect.objectContaining({
+      prefix: "releases/",
+      limit: 2,
+      include: ["httpMetadata", "customMetadata"],
+    }));
+    expect(body.items[0]).toMatchObject({ object: { key: matchedKey }, releaseAsset: { tag: "v1.0.0" } });
+    expect(body.items[1].releaseAsset).toBeNull();
+    expect(body.nextCursor).toBe("next-page");
+    await Promise.all(firstContext.pending);
+
+    const cached = await worker.fetch(
+      new Request("https://flasher.test/api/storage/releases?limit=2"),
+      { GITHUB_CACHE: kv, RELEASE_ASSETS: bucket, ASSET_PUBLIC_BASE_URL: "https://assets.test" } as never,
+      context(),
+    );
+    expect(cached.headers.get("X-RS-Key-Cache")).toBe("EDGE-HIT");
+    expect(bucket.list).toHaveBeenCalledTimes(1);
   });
 
   it("continues a mirror after the last completed asset", async () => {
@@ -290,14 +344,14 @@ describe("Worker cache", () => {
     }));
 
     const objects = new Map<string, Uint8Array>();
-    const r2 = {
+    const storage = {
       head: vi.fn(async (key: string) => objects.has(key) ? { size: objects.get(key)!.length, customMetadata: {} } : null),
       put: vi.fn(async (key: string, body: ReadableStream<Uint8Array>) => {
         objects.set(key, new Uint8Array(await new Response(body).arrayBuffer()));
         return {};
       }),
     };
-    const env = { GITHUB_CACHE: kv, RELEASE_ASSETS: r2 } as never;
+    const env = { GITHUB_CACHE: kv, RELEASE_ASSETS: storage } as never;
 
     await syncMirror(env);
     expect(JSON.parse(kv.values.get("mirror:v1") || "{}").cursorAssetId).toBe(1);

@@ -14,6 +14,7 @@ import {
   type GitHubOidcEnv,
   verifyGitHubOidcToken,
 } from "./github-oidc";
+import { assetRedirect, listStorageObjects, parseStorageListQuery, publicAssetUrl } from "./storage";
 
 const RP2350_ARM_SECURE = 0xe48bff59;
 const MAX_ASSET_SIZE = 32 * 1024 * 1024;
@@ -25,6 +26,7 @@ const MAX_LIMIT = 50;
 export interface PreviewEnv extends GitHubOidcEnv {
   PREVIEWS?: D1Database;
   RELEASE_ASSETS?: R2Bucket;
+  ASSET_PUBLIC_BASE_URL?: string;
 }
 
 interface BuildRow {
@@ -62,6 +64,16 @@ interface AssetRow {
   size: number;
   sha256: string;
   r2_key: string;
+}
+
+interface PreviewInventoryRow extends BuildRow {
+  asset_id: number;
+  asset_build_id: string;
+  asset_variant: string;
+  asset_filename: string;
+  asset_size: number;
+  asset_sha256: string;
+  asset_storage_key: string;
 }
 
 interface Cursor {
@@ -181,7 +193,7 @@ export async function validatePreviewAssetBytes(
   if (image.familyId !== RP2350_ARM_SECURE) throw new Error(`${asset.filename} does not target RP2350 Arm Secure.`);
 }
 
-function previewR2Key(metadata: PreviewUploadMetadata, variant: string, sha256: string): string {
+function previewStorageKey(metadata: PreviewUploadMetadata, variant: string, sha256: string): string {
   return `previews/${metadata.runId}/${metadata.runAttempt}/${sha256}-${variant}.uf2`;
 }
 
@@ -423,7 +435,7 @@ async function uploadPreview(request: Request, env: PreviewEnv): Promise<Respons
       INSERT INTO preview_assets (build_id, variant, filename, size, sha256, r2_key) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT (build_id, variant) DO UPDATE SET
         filename = excluded.filename, size = excluded.size, sha256 = excluded.sha256, r2_key = excluded.r2_key
-    `).bind(buildId, asset.variant, asset.filename, asset.size, asset.sha256, previewR2Key(metadata, asset.variant, asset.sha256)));
+    `).bind(buildId, asset.variant, asset.filename, asset.size, asset.sha256, previewStorageKey(metadata, asset.variant, asset.sha256)));
   }
   if (statements.length) await env.PREVIEWS.batch(statements);
 
@@ -431,7 +443,7 @@ async function uploadPreview(request: Request, env: PreviewEnv): Promise<Respons
     for (const asset of metadata.assets) {
       const bytes = files.get(asset.variant);
       if (!bytes) throw new Error(`Missing ${asset.filename}.`);
-      await env.RELEASE_ASSETS.put(previewR2Key(metadata, asset.variant, asset.sha256), bytes, {
+      await env.RELEASE_ASSETS.put(previewStorageKey(metadata, asset.variant, asset.sha256), bytes, {
         sha256: Uint8Array.from(asset.sha256.match(/../g) || [], (value) => Number.parseInt(value, 16)).buffer,
         httpMetadata: {
           contentType: "application/octet-stream",
@@ -445,7 +457,7 @@ async function uploadPreview(request: Request, env: PreviewEnv): Promise<Respons
       UPDATE preview_builds SET status = 'ready', published_at = ?, error = NULL WHERE id = ? AND status = 'uploading'
     `).bind(now, buildId).run();
   } catch (error) {
-    const message = error instanceof Error ? error.message.slice(0, 500) : "R2 upload failed.";
+    const message = error instanceof Error ? error.message.slice(0, 500) : "Asset upload failed.";
     await env.PREVIEWS.prepare("UPDATE preview_builds SET status = 'failed', error = ? WHERE id = ?")
       .bind(message, buildId).run();
     return invalid("Preview storage failed.", 502);
@@ -456,27 +468,80 @@ async function uploadPreview(request: Request, env: PreviewEnv): Promise<Respons
 
 async function servePreviewAsset(env: PreviewEnv, assetId: number): Promise<Response> {
   if (!env.PREVIEWS || !env.RELEASE_ASSETS) return invalid("Preview storage is not configured.", 503);
+  if (!publicAssetUrl(env.ASSET_PUBLIC_BASE_URL, "previews/test")) return invalid("Public asset storage is not configured.", 503);
   if (!Number.isSafeInteger(assetId) || assetId <= 0) return invalid("Invalid preview asset.");
   const row = await env.PREVIEWS.prepare(`
     SELECT a.* FROM preview_assets a JOIN preview_builds b ON b.id = a.build_id
     WHERE a.id = ? AND b.status = 'ready' AND b.expires_at > ?
   `).bind(assetId, Math.floor(Date.now() / 1000)).first<AssetRow>();
   if (!row) return invalid("Preview asset not found.", 404);
-  const object = await env.RELEASE_ASSETS.get(row.r2_key);
-  if (!object || object.size !== row.size || object.customMetadata?.sha256 !== row.sha256) {
-    return invalid("Preview asset is unavailable.", 404);
+  return assetRedirect(env.ASSET_PUBLIC_BASE_URL, row.r2_key, "public, max-age=60, s-maxage=60")!;
+}
+
+async function listPreviewStorage(request: Request, env: PreviewEnv): Promise<Response> {
+  if (!env.PREVIEWS || !env.RELEASE_ASSETS) return invalid("Preview storage is not configured.", 503);
+  if (!publicAssetUrl(env.ASSET_PUBLIC_BASE_URL, "previews/test")) return invalid("Public asset storage is not configured.", 503);
+  const url = new URL(request.url);
+  const query = parseStorageListQuery(url);
+  const buildId = (url.searchParams.get("buildId") || "").trim();
+  if (!query || (buildId && !/^[0-9]+:[0-9]+$/.test(buildId))) return invalid("Invalid storage inventory query.");
+
+  const [runId, runAttempt] = buildId ? buildId.split(":") : [];
+  const prefix = buildId ? `previews/${runId}/${runAttempt}/` : "previews/";
+  try {
+    const listed = await listStorageObjects(env.RELEASE_ASSETS, env.ASSET_PUBLIC_BASE_URL!, prefix, query);
+    if (!listed.objects.length) return json({ items: [], nextCursor: listed.nextCursor }, {
+      headers: { "Cache-Control": "public, max-age=15, s-maxage=30" },
+    });
+
+    const placeholders = listed.objects.map(() => "?").join(",");
+    const rows = await env.PREVIEWS.prepare(`
+      SELECT
+        b.*,
+        (SELECT COUNT(*) FROM preview_assets c WHERE c.build_id = b.id) AS asset_count,
+        a.id AS asset_id,
+        a.build_id AS asset_build_id,
+        a.variant AS asset_variant,
+        a.filename AS asset_filename,
+        a.size AS asset_size,
+        a.sha256 AS asset_sha256,
+        a.r2_key AS asset_storage_key
+      FROM preview_assets a
+      JOIN preview_builds b ON b.id = a.build_id
+      WHERE a.r2_key IN (${placeholders}) AND b.status = 'ready' AND b.expires_at > ?
+    `).bind(...listed.objects.map((object) => object.key), Math.floor(Date.now() / 1000)).all<PreviewInventoryRow>();
+    const buildIds = [...new Set(rows.results.map((row) => row.id))];
+    const pullRequests = await pullRequestsForBuilds(env.PREVIEWS, buildIds);
+    const byKey = new Map(rows.results.map((row) => [row.asset_storage_key, row]));
+    const items = listed.objects.flatMap((object) => {
+      const row = byKey.get(object.key);
+      if (!row) return [];
+      return [{
+        object,
+        asset: {
+          ...toAsset({
+            id: row.asset_id,
+            build_id: row.asset_build_id,
+            variant: row.asset_variant,
+            filename: row.asset_filename,
+            size: row.asset_size,
+            sha256: row.asset_sha256,
+            r2_key: row.asset_storage_key,
+          }),
+          storageKey: row.asset_storage_key,
+        },
+        build: {
+          ...toSummary(row, pullRequests.get(row.id) || []),
+          status: "ready" as const,
+        },
+      }];
+    });
+    return json({ items, nextCursor: listed.nextCursor }, {
+      headers: { "Cache-Control": "public, max-age=15, s-maxage=30" },
+    });
+  } catch (error) {
+    return invalid(error instanceof Error ? error.message : "Storage inventory is unavailable.", 502);
   }
-  return new Response(object.body, {
-    headers: {
-      "Cache-Control": "public, max-age=60, s-maxage=60",
-      "Cloudflare-CDN-Cache-Control": "public, max-age=60",
-      "Content-Disposition": `attachment; filename="${row.filename}"; filename*=UTF-8''${encodeURIComponent(row.filename)}`,
-      "Content-Length": String(row.size),
-      "Content-Type": "application/octet-stream",
-      "ETag": object.httpEtag,
-      "X-Content-Type-Options": "nosniff",
-    },
-  });
 }
 
 export async function handlePreviewRequest(request: Request, env: PreviewEnv): Promise<Response | null> {
@@ -503,6 +568,7 @@ export async function handlePreviewRequest(request: Request, env: PreviewEnv): P
   }
   const assetMatch = url.pathname.match(/^\/api\/preview-assets\/(\d+)$/);
   if (assetMatch && request.method === "GET") return servePreviewAsset(env, Number(assetMatch[1]));
+  if (url.pathname === "/api/storage/previews" && request.method === "GET") return listPreviewStorage(request, env);
   return null;
 }
 
@@ -521,4 +587,4 @@ export async function cleanupPreviews(env: PreviewEnv): Promise<void> {
   await env.PREVIEWS.prepare(`DELETE FROM preview_builds WHERE id IN (${placeholders})`).bind(...ids).run();
 }
 
-export { previewR2Key };
+export { previewStorageKey };

@@ -1,0 +1,636 @@
+openapi: 3.1.0
+info:
+  title: RS-Key Web Flasher API
+  version: 1.0.0
+  description: |
+    Public API for verified RS-Key firmware releases, CI preview builds, and
+    asset storage inventory. Firmware download endpoints validate their
+    metadata and return a 307 redirect to the public storage domain.
+    Read-only API responses use the runtime cache and declare their TTL with
+    Cache-Control.
+  license:
+    name: cofob.dev License
+    url: https://cofob.dev/license/
+servers:
+  - url: /
+    description: Current host
+tags:
+  - name: Releases
+  - name: Previews
+  - name: Storage inventory
+paths:
+  /api/releases:
+    get:
+      tags: [Releases]
+      summary: List verified releases
+      description: Returns the cached GitHub release manifest after server-side attestation verification.
+      operationId: listReleases
+      responses:
+        "200":
+          description: Verified release manifest.
+          headers:
+            X-RS-Key-Cache:
+              schema: { type: string }
+              description: Metadata source or edge-cache status.
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReleaseManifest" }
+              examples:
+                current:
+                  value:
+                    refreshedAt: "2026-08-29T19:07:02.978Z"
+                    stale: false
+                    releases:
+                      - id: 370369339
+                        tag: v0.4.10
+                        name: RS-Key v0.4.10
+                        publishedAt: "2026-08-14T05:22:15Z"
+                        prerelease: false
+                        immutable: true
+                        assets:
+                          - id: 513973851
+                            name: rs-key-v0.4.10-default.uf2
+                            size: 1615360
+                            sha256: f9944a0c0a657cc5ff0b0c0c0aa5c3315ad58f2128410007221ab3269934998f
+                        attestation:
+                          repositoryId: 1266469959
+                          refDigest: sha1:977e7b67ae74db48424d44ae70f694bd6c92b6d3
+                          bundle: {}
+        "502": { $ref: "#/components/responses/UpstreamError" }
+
+  /api/assets/{assetId}:
+    get:
+      tags: [Releases]
+      summary: Get a release asset download
+      description: |
+        Redirects an existing stored object without validating its contents during GET.
+        If the object is not stored, the server validates the release metadata and file
+        while it copies the asset from GitHub, then redirects the client. The client
+        validates the downloaded size and SHA-256 value.
+      operationId: redirectReleaseAsset
+      parameters:
+        - $ref: "#/components/parameters/AssetId"
+        - name: tag
+          in: query
+          required: true
+          schema: { type: string, pattern: "^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$" }
+          example: v0.4.10
+        - name: name
+          in: query
+          required: true
+          schema: { type: string, maxLength: 200 }
+          example: rs-key-v0.4.10-default.uf2
+        - name: sha256
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/Sha256" }
+        - name: size
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1, maximum: 33554432 }
+          example: 1615360
+      responses:
+        "307": { $ref: "#/components/responses/AssetRedirect" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+
+  /api/previews:
+    get:
+      tags: [Previews]
+      summary: Search public preview builds
+      operationId: listPreviews
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 200 }
+          description: Search branch, actor, commit, pull request number, or pull request title.
+        - name: kind
+          in: query
+          schema: { type: string, enum: [all, pr, main], default: all }
+        - name: pr
+          in: query
+          schema: { type: integer, minimum: 1 }
+        - name: branch
+          in: query
+          schema: { type: string, maxLength: 255 }
+        - name: commit
+          in: query
+          schema: { type: string, pattern: "^[0-9a-fA-F]{4,40}$" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: Opaque cursor from the previous response.
+      responses:
+        "200":
+          description: Page of ready, non-expired builds.
+          headers:
+            X-RS-Key-Cache: { $ref: "#/components/headers/CacheStatus" }
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PreviewList" }
+              examples:
+                page:
+                  value:
+                    items:
+                      - id: "123:2"
+                        runId: 123
+                        runAttempt: 2
+                        event: pull_request
+                        commitSha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                        branch: preview/api
+                        actor: contributor
+                        runUrl: https://github.com/TheMaxMur/RS-Key/actions/runs/123
+                        repository: TheMaxMur/RS-Key
+                        sourceRepository: contributor/RS-Key
+                        createdAt: "2026-08-28T12:00:00.000Z"
+                        publishedAt: "2026-08-28T12:05:00.000Z"
+                        expiresAt: "2027-08-28T12:05:00.000Z"
+                        pullRequests:
+                          - number: 16
+                            title: Preview API
+                            url: https://github.com/TheMaxMur/RS-Key/pull/16
+                            baseBranch: main
+                        assetCount: 20
+                    nextCursor: null
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+    post:
+      tags: [Previews]
+      summary: Publish a CI preview build
+      description: |
+        Accepts one metadata document and the complete set of 20 UF2 variants.
+        The bearer token must be a short-lived GitHub Actions OIDC token for the
+        configured repository and workflow.
+      operationId: uploadPreview
+      security:
+        - githubOidc: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - metadata
+                - "asset:default"
+                - "asset:pqc"
+                - "asset:fips"
+                - "asset:fips-pqc"
+                - "asset:strong-pin"
+                - "asset:strong-pin-pqc"
+                - "asset:always-uv"
+                - "asset:always-uv-pqc"
+                - "asset:strict-up"
+                - "asset:strict-up-pqc"
+                - "asset:display"
+                - "asset:2mb"
+                - "asset:16mb"
+                - "asset:board-waveshare-one"
+                - "asset:board-tenstar-usb"
+                - "asset:board-seeed-xiao"
+                - "asset:board-waveshare-touch-lcd"
+                - "asset:board-abrobot-4m"
+                - "asset:board-abrobot-16m"
+                - "asset:strict-config"
+              properties:
+                metadata:
+                  type: string
+                  description: JSON-encoded PreviewUploadMetadata document.
+                  example: >-
+                    {"schemaVersion":1,"repository":"TheMaxMur/RS-Key","repositoryId":1266469959,"event":"pull_request","runId":123,"runAttempt":2,"runUrl":"https://github.com/TheMaxMur/RS-Key/actions/runs/123","commitSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branch":"preview/api","actor":"contributor","sourceRepository":"contributor/RS-Key","createdAt":"2026-08-28T12:00:00.000Z","pullRequests":[{"number":16,"title":"Preview API","url":"https://github.com/TheMaxMur/RS-Key/pull/16","baseBranch":"main"}],"assets":[{"variant":"default","filename":"firmware-default.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"pqc","filename":"firmware-pqc.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"fips","filename":"firmware-fips.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"fips-pqc","filename":"firmware-fips-pqc.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"strong-pin","filename":"firmware-strong-pin.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"strong-pin-pqc","filename":"firmware-strong-pin-pqc.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"always-uv","filename":"firmware-always-uv.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"always-uv-pqc","filename":"firmware-always-uv-pqc.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"strict-up","filename":"firmware-strict-up.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"strict-up-pqc","filename":"firmware-strict-up-pqc.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"display","filename":"firmware-display.uf2","size":2004992,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"2mb","filename":"firmware-2mb.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"16mb","filename":"firmware-16mb.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"board-waveshare-one","filename":"firmware-board-waveshare-one.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"board-tenstar-usb","filename":"firmware-board-tenstar-usb.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"board-seeed-xiao","filename":"firmware-board-seeed-xiao.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"board-waveshare-touch-lcd","filename":"firmware-board-waveshare-touch-lcd.uf2","size":2004992,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"board-abrobot-4m","filename":"firmware-board-abrobot-4m.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"board-abrobot-16m","filename":"firmware-board-abrobot-16m.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"variant":"strict-config","filename":"firmware-strict-config.uf2","size":1615360,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}
+                "asset:default": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:pqc": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:fips": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:fips-pqc": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:strong-pin": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:strong-pin-pqc": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:always-uv": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:always-uv-pqc": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:strict-up": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:strict-up-pqc": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:display": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:2mb": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:16mb": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:board-waveshare-one": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:board-tenstar-usb": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:board-seeed-xiao": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:board-waveshare-touch-lcd": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:board-abrobot-4m": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:board-abrobot-16m": { $ref: "#/components/schemas/BinaryAsset" }
+                "asset:strict-config": { $ref: "#/components/schemas/BinaryAsset" }
+      responses:
+        "200":
+          description: The workflow run was already published with identical metadata.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PreviewBuild" }
+        "201":
+          description: Preview build created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PreviewBuild" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: The workflow run already has different metadata.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+
+  /api/previews/{buildId}:
+    get:
+      tags: [Previews]
+      summary: Get one public preview build
+      operationId: getPreview
+      parameters:
+        - name: buildId
+          in: path
+          required: true
+          schema: { type: string, pattern: "^[0-9]+:[0-9]+$" }
+          example: "123:2"
+      responses:
+        "200":
+          description: Ready, non-expired preview build with its assets.
+          headers:
+            X-RS-Key-Cache: { $ref: "#/components/headers/CacheStatus" }
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PreviewBuild" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+
+  /api/preview-assets/{assetId}:
+    get:
+      tags: [Previews]
+      summary: Get a preview asset download
+      description: Redirects a ready, non-expired preview asset without validating the stored file during GET. The file was validated during upload and is validated again by the client after download.
+      operationId: redirectPreviewAsset
+      parameters:
+        - $ref: "#/components/parameters/AssetId"
+      responses:
+        "307": { $ref: "#/components/responses/AssetRedirect" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+
+  /api/storage/releases:
+    get:
+      tags: [Storage inventory]
+      summary: List stored release objects
+      description: Returns every stored object under the selected release prefix and adds matching release metadata when available.
+      operationId: listStoredReleaseObjects
+      parameters:
+        - $ref: "#/components/parameters/StorageLimit"
+        - $ref: "#/components/parameters/StorageCursor"
+        - name: tag
+          in: query
+          schema: { type: string, pattern: "^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$" }
+          example: v0.4.10
+      responses:
+        "200":
+          description: Page of stored release objects.
+          headers:
+            X-RS-Key-Cache: { $ref: "#/components/headers/CacheStatus" }
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StoredReleaseList" }
+              examples:
+                page:
+                  value:
+                    items:
+                      - object:
+                          key: releases/v0.4.10/rs-key-v0.4.10-default.uf2
+                          version: 3152d9b8
+                          size: 1615360
+                          etag: 8e946c34dc476465e96e7f54c31acc98
+                          uploadedAt: "2026-08-26T16:24:47.000Z"
+                          storageClass: Standard
+                          checksums:
+                            sha256: f9944a0c0a657cc5ff0b0c0c0aa5c3315ad58f2128410007221ab3269934998f
+                          httpMetadata:
+                            contentType: application/octet-stream
+                            cacheControl: public, max-age=31536000, immutable
+                          customMetadata:
+                            assetId: "513973851"
+                            tag: v0.4.10
+                          publicUrl: https://rskey-assets.cofob.dev/releases/v0.4.10/rs-key-v0.4.10-default.uf2
+                        releaseAsset:
+                          releaseId: 370369339
+                          tag: v0.4.10
+                          releaseName: RS-Key v0.4.10
+                          publishedAt: "2026-08-14T05:22:15Z"
+                          prerelease: false
+                          immutable: true
+                          asset:
+                            id: 513973851
+                            name: rs-key-v0.4.10-default.uf2
+                            size: 1615360
+                            sha256: f9944a0c0a657cc5ff0b0c0c0aa5c3315ad58f2128410007221ab3269934998f
+                    nextCursor: null
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+
+  /api/storage/previews:
+    get:
+      tags: [Storage inventory]
+      summary: List stored public preview objects
+      description: Returns only objects linked to ready and non-expired preview builds in the metadata database.
+      operationId: listStoredPreviewObjects
+      parameters:
+        - $ref: "#/components/parameters/StorageLimit"
+        - $ref: "#/components/parameters/StorageCursor"
+        - name: buildId
+          in: query
+          schema: { type: string, pattern: "^[0-9]+:[0-9]+$" }
+          example: "123:2"
+      responses:
+        "200":
+          description: Page of public preview objects with normalized database metadata.
+          headers:
+            X-RS-Key-Cache: { $ref: "#/components/headers/CacheStatus" }
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StoredPreviewList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+
+components:
+  securitySchemes:
+    githubOidc:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Short-lived GitHub Actions OIDC token for the configured publisher workflow.
+  parameters:
+    AssetId:
+      name: assetId
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+      example: 513973851
+    StorageLimit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    StorageCursor:
+      name: cursor
+      in: query
+      schema: { type: string, maxLength: 2048 }
+      description: Opaque cursor returned by storage in the previous response.
+  headers:
+    CacheStatus:
+      description: EDGE-HIT when the response came from the runtime cache; otherwise the origin or storage status.
+      schema: { type: string }
+    CacheControl:
+      description: Public response caching policy.
+      schema: { type: string }
+  responses:
+    AssetRedirect:
+      description: Temporary redirect to the public asset. File validation does not occur during this GET request.
+      headers:
+        Location:
+          required: true
+          schema: { type: string, format: uri }
+          example: https://rskey-assets.cofob.dev/releases/v0.4.10/rs-key-v0.4.10-default.uf2
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-RS-Key-Cache:
+          $ref: "#/components/headers/CacheStatus"
+    BadRequest:
+      description: Invalid path, query, metadata, or file data.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: Invalid asset request. }
+    Unauthorized:
+      description: Missing or invalid GitHub OIDC token.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: Unauthorized. }
+    NotFound:
+      description: The requested resource is not available.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: Not found. }
+    UpstreamError:
+      description: GitHub, asset storage, or another upstream service failed.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: Storage inventory is unavailable. }
+    StorageUnavailable:
+      description: Required database, asset storage, or public-domain settings are not configured.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: Public asset storage is not configured. }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+    Sha256:
+      type: string
+      pattern: "^[0-9a-f]{64}$"
+      example: f9944a0c0a657cc5ff0b0c0c0aa5c3315ad58f2128410007221ab3269934998f
+    BinaryAsset:
+      type: string
+      format: binary
+    ReleaseAsset:
+      type: object
+      required: [id, name, size, sha256]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        size: { type: integer }
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        downloadUrl: { type: string, format: uri }
+    ReleaseAttestation:
+      type: object
+      required: [repositoryId, refDigest, bundle]
+      properties:
+        repositoryId: { type: integer }
+        refDigest: { type: string }
+        bundle:
+          type: object
+          additionalProperties: true
+    Release:
+      type: object
+      required: [id, tag, name, publishedAt, prerelease, immutable, assets]
+      properties:
+        id: { type: integer }
+        tag: { type: string }
+        name: { type: string }
+        publishedAt: { type: string, format: date-time }
+        prerelease: { type: boolean }
+        immutable: { type: boolean }
+        assets:
+          type: array
+          items: { $ref: "#/components/schemas/ReleaseAsset" }
+        attestation: { $ref: "#/components/schemas/ReleaseAttestation" }
+    ReleaseManifest:
+      type: object
+      required: [refreshedAt, stale, releases]
+      properties:
+        refreshedAt: { type: string, format: date-time }
+        stale: { type: boolean }
+        releases:
+          type: array
+          items: { $ref: "#/components/schemas/Release" }
+    PullRequest:
+      type: object
+      required: [number, title, url, baseBranch]
+      properties:
+        number: { type: integer }
+        title: { type: string }
+        url: { type: string, format: uri }
+        baseBranch: { type: string }
+    PreviewAsset:
+      type: object
+      required: [id, buildId, variant, filename, size, sha256]
+      properties:
+        id: { type: integer }
+        buildId: { type: string }
+        variant: { type: string }
+        filename: { type: string }
+        size: { type: integer }
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        storageKey: { type: string }
+    PreviewSummary:
+      type: object
+      required: [id, runId, runAttempt, event, commitSha, branch, actor, runUrl, repository, sourceRepository, createdAt, publishedAt, expiresAt, pullRequests, assetCount]
+      properties:
+        id: { type: string, example: "123:2" }
+        runId: { type: integer }
+        runAttempt: { type: integer }
+        event: { type: string, enum: [pull_request, push] }
+        commitSha: { type: string, pattern: "^[0-9a-f]{40}$" }
+        branch: { type: string }
+        actor: { type: string }
+        runUrl: { type: string, format: uri }
+        repository: { type: string }
+        sourceRepository: { type: string }
+        createdAt: { type: string, format: date-time }
+        publishedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        pullRequests:
+          type: array
+          items: { $ref: "#/components/schemas/PullRequest" }
+        assetCount: { type: integer }
+        status: { type: string, const: ready }
+    PreviewBuild:
+      allOf:
+        - $ref: "#/components/schemas/PreviewSummary"
+        - type: object
+          required: [assets]
+          properties:
+            assets:
+              type: array
+              items: { $ref: "#/components/schemas/PreviewAsset" }
+    PreviewList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/PreviewSummary" }
+        nextCursor: { type: [string, "null"] }
+    StringMap:
+      type: object
+      additionalProperties: { type: string }
+    StoredObject:
+      type: object
+      required: [key, version, size, etag, uploadedAt, storageClass, checksums, httpMetadata, customMetadata, publicUrl]
+      properties:
+        key: { type: string }
+        version: { type: string }
+        size: { type: integer }
+        etag: { type: string }
+        uploadedAt: { type: string, format: date-time }
+        storageClass: { type: string }
+        checksums: { $ref: "#/components/schemas/StringMap" }
+        httpMetadata: { $ref: "#/components/schemas/StringMap" }
+        customMetadata: { $ref: "#/components/schemas/StringMap" }
+        publicUrl: { type: string, format: uri }
+    StoredReleaseMatch:
+      type: object
+      required: [releaseId, tag, releaseName, publishedAt, prerelease, immutable, asset]
+      properties:
+        releaseId: { type: integer }
+        tag: { type: string }
+        releaseName: { type: string }
+        publishedAt: { type: string, format: date-time }
+        prerelease: { type: boolean }
+        immutable: { type: boolean }
+        asset: { $ref: "#/components/schemas/ReleaseAsset" }
+    StoredReleaseItem:
+      type: object
+      required: [object, releaseAsset]
+      properties:
+        object: { $ref: "#/components/schemas/StoredObject" }
+        releaseAsset:
+          oneOf:
+            - $ref: "#/components/schemas/StoredReleaseMatch"
+            - type: "null"
+    StoredReleaseList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/StoredReleaseItem" }
+        nextCursor: { type: [string, "null"] }
+    StoredPreviewItem:
+      type: object
+      required: [object, asset, build]
+      properties:
+        object: { $ref: "#/components/schemas/StoredObject" }
+        asset: { $ref: "#/components/schemas/PreviewAsset" }
+        build: { $ref: "#/components/schemas/PreviewSummary" }
+    StoredPreviewList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/StoredPreviewItem" }
+        nextCursor: { type: [string, "null"] }
+  examples:
+    PreviewSummary:
+      value:
+        id: "123:2"
+        runId: 123
+        runAttempt: 2
+        event: pull_request
+        commitSha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        branch: preview/api
+        actor: contributor
+        runUrl: https://github.com/TheMaxMur/RS-Key/actions/runs/123
+        repository: TheMaxMur/RS-Key
+        sourceRepository: contributor/RS-Key
+        createdAt: "2026-08-28T12:00:00.000Z"
+        publishedAt: "2026-08-28T12:05:00.000Z"
+        expiresAt: "2027-08-28T12:05:00.000Z"
+        pullRequests:
+          - number: 16
+            title: Preview API
+            url: https://github.com/TheMaxMur/RS-Key/pull/16
+            baseBranch: main
+        assetCount: 20
