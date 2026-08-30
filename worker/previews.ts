@@ -1,4 +1,3 @@
-import { parseUf2 } from "../lib/uf2";
 import {
   PREVIEW_VARIANTS,
   previewAssetFilename,
@@ -16,7 +15,6 @@ import {
 } from "./github-oidc";
 import { assetRedirect, listStorageObjects, parseStorageListQuery, publicAssetUrl } from "./storage";
 
-const RP2350_ARM_SECURE = 0xe48bff59;
 const MAX_ASSET_SIZE = 32 * 1024 * 1024;
 const MAX_UPLOAD_SIZE = 96 * 1024 * 1024;
 const RETENTION_SECONDS = 365 * 24 * 60 * 60;
@@ -178,21 +176,6 @@ function canonicalMetadata(metadata: PreviewUploadMetadata): string {
   });
 }
 
-async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes.slice().buffer);
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-export async function validatePreviewAssetBytes(
-  asset: PreviewUploadMetadata["assets"][number],
-  bytes: Uint8Array,
-): Promise<void> {
-  if (bytes.byteLength !== asset.size) throw new Error(`File size does not match ${asset.filename}.`);
-  if (await sha256Hex(bytes) !== asset.sha256) throw new Error(`SHA-256 does not match ${asset.filename}.`);
-  const image = parseUf2(bytes);
-  if (image.familyId !== RP2350_ARM_SECURE) throw new Error(`${asset.filename} does not target RP2350 Arm Secure.`);
-}
-
 function previewStorageKey(metadata: PreviewUploadMetadata, variant: string, sha256: string): string {
   return `previews/${metadata.runId}/${metadata.runAttempt}/${sha256}-${variant}.uf2`;
 }
@@ -351,8 +334,7 @@ async function listPreviews(request: Request, env: PreviewEnv): Promise<Response
   });
 }
 
-async function readUpload(request: Request): Promise<{ metadata: PreviewUploadMetadata; files: Map<string, Uint8Array> }> {
-  const form = await request.formData();
+export function parsePreviewUploadForm(form: FormData): { metadata: PreviewUploadMetadata; files: Map<string, File> } {
   const rawMetadata = form.get("metadata");
   if (typeof rawMetadata !== "string") throw new Error("The metadata field is required.");
   let decoded: unknown;
@@ -362,16 +344,18 @@ async function readUpload(request: Request): Promise<{ metadata: PreviewUploadMe
     throw new Error("The metadata field is not valid JSON.");
   }
   const metadata = parsePreviewMetadata(decoded);
-  const files = new Map<string, Uint8Array>();
+  const files = new Map<string, File>();
   for (const asset of metadata.assets) {
     const entry = form.get(`asset:${asset.variant}`);
     if (!entry || typeof entry === "string") throw new Error(`Missing ${asset.filename}.`);
     if (entry.name !== asset.filename || entry.size !== asset.size) throw new Error(`File metadata does not match ${asset.filename}.`);
-    const bytes = new Uint8Array(await entry.arrayBuffer());
-    await validatePreviewAssetBytes(asset, bytes);
-    files.set(asset.variant, bytes);
+    files.set(asset.variant, entry);
   }
   return { metadata, files };
+}
+
+async function readUpload(request: Request): Promise<{ metadata: PreviewUploadMetadata; files: Map<string, File> }> {
+  return parsePreviewUploadForm(await request.formData());
 }
 
 async function uploadPreview(request: Request, env: PreviewEnv): Promise<Response> {
@@ -441,9 +425,9 @@ async function uploadPreview(request: Request, env: PreviewEnv): Promise<Respons
 
   try {
     for (const asset of metadata.assets) {
-      const bytes = files.get(asset.variant);
-      if (!bytes) throw new Error(`Missing ${asset.filename}.`);
-      await env.RELEASE_ASSETS.put(previewStorageKey(metadata, asset.variant, asset.sha256), bytes, {
+      const file = files.get(asset.variant);
+      if (!file) throw new Error(`Missing ${asset.filename}.`);
+      await env.RELEASE_ASSETS.put(previewStorageKey(metadata, asset.variant, asset.sha256), file, {
         sha256: Uint8Array.from(asset.sha256.match(/../g) || [], (value) => Number.parseInt(value, 16)).buffer,
         httpMetadata: {
           contentType: "application/octet-stream",

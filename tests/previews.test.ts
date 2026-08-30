@@ -1,13 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { assetUrl, sha256Hex } from "../lib/assets";
+import { assetUrl } from "../lib/assets";
 import { PREVIEW_VARIANTS, previewAssetFilename, type PreviewUploadMetadata } from "../lib/previews";
-import { encodeUf2 } from "../lib/uf2";
 import { type GitHubOidcTrust, verifyGitHubOidcToken } from "../worker/github-oidc";
 import {
   handlePreviewRequest,
   parsePreviewMetadata,
+  parsePreviewUploadForm,
   previewStorageKey,
-  validatePreviewAssetBytes,
 } from "../worker/previews";
 
 const OIDC_TRUST: GitHubOidcTrust = {
@@ -108,6 +107,24 @@ describe("preview upload contract", () => {
       .toBe(`previews/123/2/${"c".repeat(64)}-default.uf2`);
   });
 
+  it("keeps upload files as blobs without copying their bytes", () => {
+    const upload = metadata();
+    const form = new FormData();
+    form.set("metadata", JSON.stringify(upload));
+    const files = new Map<string, File>();
+    for (const asset of upload.assets) {
+      const file = new File([new Uint8Array(asset.size)], asset.filename);
+      files.set(asset.variant, file);
+      form.set(`asset:${asset.variant}`, file);
+    }
+    const arrayBuffer = vi.spyOn(files.get("default")!, "arrayBuffer");
+
+    const parsed = parsePreviewUploadForm(form);
+
+    expect(parsed.files.get("default")).toBe(files.get("default"));
+    expect(arrayBuffer).not.toHaveBeenCalled();
+  });
+
   it("rejects the removed shared-token authentication before storage access", async () => {
     const response = await handlePreviewRequest(
       new Request("https://flasher.test/api/previews", {
@@ -148,29 +165,6 @@ describe("preview upload contract", () => {
       .resolves.toBe(false);
     await expect(verifyGitHubOidcToken(valid.token, { ...OIDC_TRUST, workflowRef: "untrusted" }, loadKeys))
       .resolves.toBe(false);
-  });
-
-  it("checks SHA-256, UF2 structure, and the RP2350 secure family", async () => {
-    const bytes = encodeUf2({
-      familyId: 0xe48bff59,
-      familyName: "RP2350 Arm Secure",
-      productId: 0x000f,
-      totalBytes: 256,
-      segments: [{ address: 0x10000000, data: new Uint8Array(256) }],
-    });
-    const asset = { ...metadata().assets[0], size: bytes.length, sha256: await sha256Hex(bytes) };
-    await expect(validatePreviewAssetBytes(asset, bytes)).resolves.toBeUndefined();
-    await expect(validatePreviewAssetBytes({ ...asset, sha256: "0".repeat(64) }, bytes)).rejects.toThrow("SHA-256");
-
-    const nonSecure = encodeUf2({
-      familyId: 0xe48bff5b,
-      familyName: "RP2350 Arm Non-secure",
-      productId: 0x000f,
-      totalBytes: 256,
-      segments: [{ address: 0x10000000, data: new Uint8Array(256) }],
-    });
-    await expect(validatePreviewAssetBytes({ ...asset, sha256: await sha256Hex(nonSecure) }, nonSecure))
-      .rejects.toThrow("RP2350 Arm Secure");
   });
 
   it("routes preview assets by their source type", () => {
