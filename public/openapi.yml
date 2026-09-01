@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: RS-Key Web Flasher API
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Public API for verified RS-Key firmware releases, CI preview builds, and
     asset storage inventory. Firmware download endpoints validate their
@@ -283,6 +283,28 @@ paths:
         "307": { $ref: "#/components/responses/AssetRedirect" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "410":
+          description: The individual object was removed after the archive grace period. Reload the build metadata and use its archive.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+
+  /api/preview-archives/{buildId}:
+    get:
+      tags: [Previews]
+      summary: Get a compressed preview archive
+      description: Redirects to a ready, non-expired TAR archive compressed with Zstandard level 15. The API does not decompress the archive.
+      operationId: redirectPreviewArchive
+      parameters:
+        - name: buildId
+          in: path
+          required: true
+          schema: { type: string, pattern: "^[0-9]+:[0-9]+$" }
+          example: "123:2"
+      responses:
+        "307": { $ref: "#/components/responses/AssetRedirect" }
+        "404": { $ref: "#/components/responses/NotFound" }
         "503": { $ref: "#/components/responses/StorageUnavailable" }
 
   /api/storage/releases:
@@ -547,11 +569,31 @@ components:
       allOf:
         - $ref: "#/components/schemas/PreviewSummary"
         - type: object
-          required: [assets]
+          required: [assets, storage]
           properties:
             assets:
               type: array
               items: { $ref: "#/components/schemas/PreviewAsset" }
+            storage:
+              oneOf:
+                - $ref: "#/components/schemas/PreviewIndividualStorage"
+                - $ref: "#/components/schemas/PreviewArchiveStorage"
+    PreviewIndividualStorage:
+      type: object
+      required: [format]
+      properties:
+        format: { type: string, const: individual }
+    PreviewArchiveStorage:
+      type: object
+      required: [format, filename, size, uncompressedSize, sha256, archivedAt, downloadUrl]
+      properties:
+        format: { type: string, const: tar.zst }
+        filename: { type: string, example: preview-123-2.tar.zst }
+        size: { type: integer, minimum: 1 }
+        uncompressedSize: { type: integer, minimum: 1, maximum: 100663296 }
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        archivedAt: { type: string, format: date-time }
+        downloadUrl: { type: string, format: uri }
     PreviewList:
       type: object
       required: [items, nextCursor]
@@ -605,13 +647,35 @@ components:
           type: array
           items: { $ref: "#/components/schemas/StoredReleaseItem" }
         nextCursor: { type: [string, "null"] }
-    StoredPreviewItem:
+    PreviewArchiveInventory:
       type: object
-      required: [object, asset, build]
+      required: [buildId, filename, size, uncompressedSize, sha256, storageKey, archivedAt, legacyDeleteAfter, legacyDeletedAt]
       properties:
-        object: { $ref: "#/components/schemas/StoredObject" }
-        asset: { $ref: "#/components/schemas/PreviewAsset" }
-        build: { $ref: "#/components/schemas/PreviewSummary" }
+        buildId: { type: string }
+        filename: { type: string }
+        size: { type: integer }
+        uncompressedSize: { type: integer }
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        storageKey: { type: string }
+        archivedAt: { type: string, format: date-time }
+        legacyDeleteAfter: { type: string, format: date-time }
+        legacyDeletedAt: { type: [string, "null"], format: date-time }
+    StoredPreviewItem:
+      oneOf:
+        - type: object
+          required: [kind, object, asset, build]
+          properties:
+            kind: { type: string, const: asset }
+            object: { $ref: "#/components/schemas/StoredObject" }
+            asset: { $ref: "#/components/schemas/PreviewAsset" }
+            build: { $ref: "#/components/schemas/PreviewSummary" }
+        - type: object
+          required: [kind, object, archive, build]
+          properties:
+            kind: { type: string, const: archive }
+            object: { $ref: "#/components/schemas/StoredObject" }
+            archive: { $ref: "#/components/schemas/PreviewArchiveInventory" }
+            build: { $ref: "#/components/schemas/PreviewSummary" }
     StoredPreviewList:
       type: object
       required: [items, nextCursor]

@@ -39,3 +39,4 @@ yarn-error.log*
 /outputs/
 /work/
 *.tsbuildinfo
+/wasm/preview-archive/target/

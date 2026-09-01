@@ -3,10 +3,13 @@ import { assetUrl } from "../lib/assets";
 import { PREVIEW_VARIANTS, previewAssetFilename, type PreviewUploadMetadata } from "../lib/previews";
 import { type GitHubOidcTrust, verifyGitHubOidcToken } from "../worker/github-oidc";
 import {
+  cleanupArchivedPreview,
+  enqueuePreviewArchive,
   handlePreviewRequest,
   parsePreviewMetadata,
   parsePreviewUploadForm,
   previewStorageKey,
+  reconcilePreviewArchives,
 } from "../worker/previews";
 
 const OIDC_TRUST: GitHubOidcTrust = {
@@ -179,6 +182,27 @@ describe("preview upload contract", () => {
       variant: "default",
       version: "aaaaaaaaaaaa",
     })).toBe("/api/preview-assets/77");
+
+    expect(assetUrl({
+      source: "preview",
+      id: 77,
+      buildId: "123:2",
+      commitSha: "a".repeat(40),
+      name: "firmware-default.uf2",
+      size: 512,
+      sha256: "b".repeat(64),
+      variant: "default",
+      version: "aaaaaaaaaaaa",
+      archive: {
+        format: "tar.zst",
+        filename: "preview-123-2.tar.zst",
+        size: 1024,
+        uncompressedSize: 10_240,
+        sha256: "c".repeat(64),
+        archivedAt: "2026-08-29T12:00:00.000Z",
+        downloadUrl: "/api/preview-archives/123%3A2",
+      },
+    })).toBe("/api/preview-archives/123%3A2");
   });
 
   it("redirects a ready preview asset without a storage metadata check", async () => {
@@ -278,5 +302,107 @@ describe("preview upload contract", () => {
       asset: { id: 77, storageKey: publicKey },
       build: { id: "123:2", status: "ready" },
     });
+  });
+
+  it("redirects an archive and returns 410 after legacy cleanup", async () => {
+    const archiveKey = `previews/123/2/${"c".repeat(64)}-previews.tar.zst`;
+    const archiveRow = {
+      build_id: "123:2",
+      filename: "preview-123-2.tar.zst",
+      size: 1024,
+      uncompressed_size: 10_240,
+      sha256: "c".repeat(64),
+      r2_key: archiveKey,
+      archived_at: 1,
+      legacy_delete_after: 2,
+      legacy_deleted_at: 3,
+    };
+    const archiveDatabase = {
+      prepare: () => ({ bind: () => ({ first: async () => archiveRow }) }),
+    };
+    const archiveResponse = await handlePreviewRequest(
+      new Request("https://flasher.test/api/preview-archives/123%3A2"),
+      { PREVIEWS: archiveDatabase, RELEASE_ASSETS: {}, ASSET_PUBLIC_BASE_URL: "https://assets.test" } as never,
+    );
+    expect(archiveResponse?.status).toBe(307);
+    expect(archiveResponse?.headers.get("Location")).toBe(`https://assets.test/${archiveKey}`);
+
+    const deletedDatabase = {
+      prepare: () => ({ bind: () => ({ first: async () => ({
+        id: 77,
+        build_id: "123:2",
+        variant: "default",
+        filename: "firmware-default.uf2",
+        size: 512,
+        sha256: "b".repeat(64),
+        r2_key: null,
+        archive_build_id: "123:2",
+      }) }) }),
+    };
+    const deletedResponse = await handlePreviewRequest(
+      new Request("https://flasher.test/api/preview-assets/77"),
+      { PREVIEWS: deletedDatabase, RELEASE_ASSETS: {}, ASSET_PUBLIC_BASE_URL: "https://assets.test" } as never,
+    );
+    expect(deletedResponse?.status).toBe(410);
+  });
+
+  it("queues missing archives and due legacy cleanup work", async () => {
+    const sent: unknown[] = [];
+    const database = {
+      prepare: (sql: string) => ({
+        bind: () => ({
+          all: async () => ({ results: sql.includes("LEFT JOIN preview_archives")
+            ? [{ id: "123:2" }]
+            : [{ id: "124:1" }] }),
+        }),
+      }),
+    };
+    await reconcilePreviewArchives({
+      PREVIEWS: database,
+      PREVIEW_TASKS: { sendBatch: async (messages: unknown[]) => sent.push(...messages) },
+    } as never);
+    expect(sent).toEqual([
+      { body: { schemaVersion: 1, type: "archive-preview", buildId: "123:2" } },
+      { body: { schemaVersion: 1, type: "cleanup-preview", buildId: "124:1" } },
+    ]);
+  });
+
+  it("creates an immediate archive queue message", async () => {
+    const send = vi.fn();
+    await enqueuePreviewArchive({ PREVIEW_TASKS: { send } } as never, "123:2");
+    expect(send).toHaveBeenCalledWith(
+      { schemaVersion: 1, type: "archive-preview", buildId: "123:2" },
+      undefined,
+    );
+  });
+
+  it("deletes individual objects and keeps logical asset metadata", async () => {
+    const deleted: string[][] = [];
+    const batches: unknown[][] = [];
+    const database = {
+      prepare: (sql: string) => ({
+        bind: () => ({
+          first: async () => sql.includes("preview_archives") ? {
+            build_id: "123:2",
+            filename: "preview.tar.zst",
+            size: 100,
+            uncompressed_size: 1024,
+            sha256: "c".repeat(64),
+            r2_key: "archive",
+            archived_at: 1,
+            legacy_delete_after: 1,
+            legacy_deleted_at: null,
+          } : null,
+          all: async () => ({ results: [{ r2_key: "first.uf2" }, { r2_key: "second.uf2" }] }),
+        }),
+      }),
+      batch: async (statements: unknown[]) => batches.push(statements),
+    };
+    await cleanupArchivedPreview({
+      PREVIEWS: database,
+      RELEASE_ASSETS: { delete: async (keys: string[]) => deleted.push(keys) },
+    } as never, "123:2");
+    expect(deleted).toEqual([["first.uf2", "second.uf2"]]);
+    expect(batches).toHaveLength(1);
   });
 });

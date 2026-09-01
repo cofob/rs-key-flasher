@@ -2,6 +2,7 @@ import {
   PREVIEW_VARIANTS,
   previewAssetFilename,
   type PreviewAsset,
+  type PreviewArchiveStorage,
   type PreviewBuild,
   type PreviewBuildSummary,
   type PreviewKind,
@@ -25,7 +26,12 @@ export interface PreviewEnv extends GitHubOidcEnv {
   PREVIEWS?: D1Database;
   RELEASE_ASSETS?: R2Bucket;
   ASSET_PUBLIC_BASE_URL?: string;
+  PREVIEW_TASKS?: Queue<PreviewTask>;
 }
+
+export type PreviewTask =
+  | { schemaVersion: 1; type: "archive-preview"; buildId: string }
+  | { schemaVersion: 1; type: "cleanup-preview"; buildId: string };
 
 interface BuildRow {
   id: string;
@@ -61,7 +67,20 @@ interface AssetRow {
   filename: string;
   size: number;
   sha256: string;
+  r2_key: string | null;
+  archive_build_id?: string | null;
+}
+
+interface ArchiveRow {
+  build_id: string;
+  filename: string;
+  size: number;
+  uncompressed_size: number;
+  sha256: string;
   r2_key: string;
+  archived_at: number;
+  legacy_delete_after: number;
+  legacy_deleted_at: number | null;
 }
 
 interface PreviewInventoryRow extends BuildRow {
@@ -72,6 +91,18 @@ interface PreviewInventoryRow extends BuildRow {
   asset_size: number;
   asset_sha256: string;
   asset_storage_key: string;
+}
+
+interface PreviewArchiveInventoryRow extends BuildRow {
+  archive_build_id: string;
+  archive_filename: string;
+  archive_size: number;
+  archive_uncompressed_size: number;
+  archive_sha256: string;
+  archive_storage_key: string;
+  archive_archived_at: number;
+  archive_legacy_delete_after: number;
+  archive_legacy_deleted_at: number | null;
 }
 
 interface Cursor {
@@ -227,7 +258,12 @@ async function pullRequestsForBuilds(database: D1Database, ids: string[]): Promi
   return result;
 }
 
-async function getBuild(database: D1Database, id: string, includeUnavailable = false): Promise<PreviewBuild | null> {
+async function getBuild(
+  database: D1Database,
+  id: string,
+  includeUnavailable = false,
+  apiOrigin = "",
+): Promise<PreviewBuild | null> {
   const availability = includeUnavailable ? "" : "AND status = 'ready' AND expires_at > ?";
   const statement = database.prepare(`
     SELECT b.*, (SELECT COUNT(*) FROM preview_assets a WHERE a.build_id = b.id) AS asset_count
@@ -237,11 +273,21 @@ async function getBuild(database: D1Database, id: string, includeUnavailable = f
     ? await statement.bind(id).first<BuildRow>()
     : await statement.bind(id, Math.floor(Date.now() / 1000)).first<BuildRow>();
   if (!row) return null;
-  const [pullRequests, assets] = await Promise.all([
+  const [pullRequests, assets, archive] = await Promise.all([
     pullRequestsForBuilds(database, [id]),
     database.prepare("SELECT * FROM preview_assets WHERE build_id = ? ORDER BY variant").bind(id).all<AssetRow>(),
+    database.prepare("SELECT * FROM preview_archives WHERE build_id = ?").bind(id).first<ArchiveRow>(),
   ]);
-  return { ...toSummary(row, pullRequests.get(id) || []), assets: assets.results.map(toAsset) };
+  const storage = archive ? {
+    format: "tar.zst" as const,
+    filename: archive.filename,
+    size: archive.size,
+    uncompressedSize: archive.uncompressed_size,
+    sha256: archive.sha256,
+    archivedAt: new Date(archive.archived_at * 1000).toISOString(),
+    downloadUrl: `${apiOrigin}/api/preview-archives/${encodeURIComponent(id)}`,
+  } satisfies PreviewArchiveStorage : { format: "individual" as const };
+  return { ...toSummary(row, pullRequests.get(id) || []), assets: assets.results.map(toAsset), storage };
 }
 
 function parseCursor(value: string | null): Cursor | null {
@@ -358,6 +404,19 @@ async function readUpload(request: Request): Promise<{ metadata: PreviewUploadMe
   return parsePreviewUploadForm(await request.formData());
 }
 
+async function sendPreviewTask(env: PreviewEnv, task: PreviewTask, delaySeconds?: number): Promise<void> {
+  if (!env.PREVIEW_TASKS) return;
+  await env.PREVIEW_TASKS.send(task, delaySeconds === undefined ? undefined : { delaySeconds });
+}
+
+export async function enqueuePreviewCleanup(env: PreviewEnv, buildId: string): Promise<void> {
+  await sendPreviewTask(env, { schemaVersion: 1, type: "cleanup-preview", buildId }, 24 * 60 * 60);
+}
+
+export async function enqueuePreviewArchive(env: PreviewEnv, buildId: string): Promise<void> {
+  await sendPreviewTask(env, { schemaVersion: 1, type: "archive-preview", buildId });
+}
+
 async function uploadPreview(request: Request, env: PreviewEnv): Promise<Response> {
   const trust = githubOidcTrustFromEnv(env);
   if (!trust) return invalid("Preview OIDC trust is not configured.", 503);
@@ -383,7 +442,7 @@ async function uploadPreview(request: Request, env: PreviewEnv): Promise<Respons
   const existing = await env.PREVIEWS.prepare("SELECT * FROM preview_builds WHERE id = ?").bind(buildId).first<BuildRow>();
   if (existing && existing.metadata_json !== canonical) return invalid("This workflow run already has different metadata.", 409);
   if (existing?.status === "ready") {
-    const build = await getBuild(env.PREVIEWS, buildId);
+    const build = await getBuild(env.PREVIEWS, buildId, false, new URL(request.url).origin);
     return json(build, { status: 200 });
   }
   const now = Math.floor(Date.now() / 1000);
@@ -440,6 +499,7 @@ async function uploadPreview(request: Request, env: PreviewEnv): Promise<Respons
     await env.PREVIEWS.prepare(`
       UPDATE preview_builds SET status = 'ready', published_at = ?, error = NULL WHERE id = ? AND status = 'uploading'
     `).bind(now, buildId).run();
+    await enqueuePreviewArchive(env, buildId).catch(() => undefined);
   } catch (error) {
     const message = error instanceof Error ? error.message.slice(0, 500) : "Asset upload failed.";
     await env.PREVIEWS.prepare("UPDATE preview_builds SET status = 'failed', error = ? WHERE id = ?")
@@ -447,7 +507,7 @@ async function uploadPreview(request: Request, env: PreviewEnv): Promise<Respons
     return invalid("Preview storage failed.", 502);
   }
 
-  return json(await getBuild(env.PREVIEWS, buildId), { status: 201 });
+  return json(await getBuild(env.PREVIEWS, buildId, false, new URL(request.url).origin), { status: 201 });
 }
 
 async function servePreviewAsset(env: PreviewEnv, assetId: number): Promise<Response> {
@@ -455,10 +515,27 @@ async function servePreviewAsset(env: PreviewEnv, assetId: number): Promise<Resp
   if (!publicAssetUrl(env.ASSET_PUBLIC_BASE_URL, "previews/test")) return invalid("Public asset storage is not configured.", 503);
   if (!Number.isSafeInteger(assetId) || assetId <= 0) return invalid("Invalid preview asset.");
   const row = await env.PREVIEWS.prepare(`
-    SELECT a.* FROM preview_assets a JOIN preview_builds b ON b.id = a.build_id
+    SELECT a.*, ar.build_id AS archive_build_id
+    FROM preview_assets a
+    JOIN preview_builds b ON b.id = a.build_id
+    LEFT JOIN preview_archives ar ON ar.build_id = a.build_id
     WHERE a.id = ? AND b.status = 'ready' AND b.expires_at > ?
   `).bind(assetId, Math.floor(Date.now() / 1000)).first<AssetRow>();
   if (!row) return invalid("Preview asset not found.", 404);
+  if (!row.r2_key) return invalid("This preview asset is stored in an archive. Reload the preview build metadata.", 410);
+  const cacheControl = row.archive_build_id ? "no-store" : "public, max-age=60, s-maxage=60";
+  return assetRedirect(env.ASSET_PUBLIC_BASE_URL, row.r2_key, cacheControl)!;
+}
+
+async function servePreviewArchive(env: PreviewEnv, buildId: string): Promise<Response> {
+  if (!env.PREVIEWS || !env.RELEASE_ASSETS) return invalid("Preview storage is not configured.", 503);
+  if (!publicAssetUrl(env.ASSET_PUBLIC_BASE_URL, "previews/test")) return invalid("Public asset storage is not configured.", 503);
+  const row = await env.PREVIEWS.prepare(`
+    SELECT ar.* FROM preview_archives ar
+    JOIN preview_builds b ON b.id = ar.build_id
+    WHERE ar.build_id = ? AND b.status = 'ready' AND b.expires_at > ?
+  `).bind(buildId, Math.floor(Date.now() / 1000)).first<ArchiveRow>();
+  if (!row) return invalid("Preview archive not found.", 404);
   return assetRedirect(env.ASSET_PUBLIC_BASE_URL, row.r2_key, "public, max-age=60, s-maxage=60")!;
 }
 
@@ -479,7 +556,8 @@ async function listPreviewStorage(request: Request, env: PreviewEnv): Promise<Re
     });
 
     const placeholders = listed.objects.map(() => "?").join(",");
-    const rows = await env.PREVIEWS.prepare(`
+    const keys = listed.objects.map((object) => object.key);
+    const [rows, archiveRows] = await Promise.all([env.PREVIEWS.prepare(`
       SELECT
         b.*,
         (SELECT COUNT(*) FROM preview_assets c WHERE c.build_id = b.id) AS asset_count,
@@ -493,33 +571,80 @@ async function listPreviewStorage(request: Request, env: PreviewEnv): Promise<Re
       FROM preview_assets a
       JOIN preview_builds b ON b.id = a.build_id
       WHERE a.r2_key IN (${placeholders}) AND b.status = 'ready' AND b.expires_at > ?
-    `).bind(...listed.objects.map((object) => object.key), Math.floor(Date.now() / 1000)).all<PreviewInventoryRow>();
-    const buildIds = [...new Set(rows.results.map((row) => row.id))];
+    `).bind(...keys, Math.floor(Date.now() / 1000)).all<PreviewInventoryRow>(), env.PREVIEWS.prepare(`
+      SELECT
+        b.*,
+        (SELECT COUNT(*) FROM preview_assets c WHERE c.build_id = b.id) AS asset_count,
+        ar.build_id AS archive_build_id,
+        ar.filename AS archive_filename,
+        ar.size AS archive_size,
+        ar.uncompressed_size AS archive_uncompressed_size,
+        ar.sha256 AS archive_sha256,
+        ar.r2_key AS archive_storage_key,
+        ar.archived_at AS archive_archived_at,
+        ar.legacy_delete_after AS archive_legacy_delete_after,
+        ar.legacy_deleted_at AS archive_legacy_deleted_at
+      FROM preview_archives ar
+      JOIN preview_builds b ON b.id = ar.build_id
+      WHERE ar.r2_key IN (${placeholders}) AND b.status = 'ready' AND b.expires_at > ?
+    `).bind(...keys, Math.floor(Date.now() / 1000)).all<PreviewArchiveInventoryRow>()]);
+    const buildIds = [...new Set([
+      ...rows.results.map((row) => row.id),
+      ...archiveRows.results.map((row) => row.id),
+    ])];
     const pullRequests = await pullRequestsForBuilds(env.PREVIEWS, buildIds);
-    const byKey = new Map(rows.results.map((row) => [row.asset_storage_key, row]));
-    const items = listed.objects.flatMap((object) => {
-      const row = byKey.get(object.key);
-      if (!row) return [];
-      return [{
+    const assetsByKey = new Map(rows.results.map((row) => [row.asset_storage_key, row]));
+    const archivesByKey = new Map(archiveRows.results.map((row) => [row.archive_storage_key, row]));
+    const items: unknown[] = [];
+    for (const object of listed.objects) {
+      const assetRow = assetsByKey.get(object.key);
+      if (assetRow) {
+        items.push({
+          kind: "asset" as const,
+          object,
+          asset: {
+            ...toAsset({
+              id: assetRow.asset_id,
+              build_id: assetRow.asset_build_id,
+              variant: assetRow.asset_variant,
+              filename: assetRow.asset_filename,
+              size: assetRow.asset_size,
+              sha256: assetRow.asset_sha256,
+              r2_key: assetRow.asset_storage_key,
+            }),
+            storageKey: assetRow.asset_storage_key,
+          },
+          build: {
+            ...toSummary(assetRow, pullRequests.get(assetRow.id) || []),
+            status: "ready" as const,
+          },
+        });
+        continue;
+      }
+      const archiveRow = archivesByKey.get(object.key);
+      if (!archiveRow) continue;
+      items.push({
+        kind: "archive" as const,
         object,
-        asset: {
-          ...toAsset({
-            id: row.asset_id,
-            build_id: row.asset_build_id,
-            variant: row.asset_variant,
-            filename: row.asset_filename,
-            size: row.asset_size,
-            sha256: row.asset_sha256,
-            r2_key: row.asset_storage_key,
-          }),
-          storageKey: row.asset_storage_key,
+        archive: {
+          buildId: archiveRow.archive_build_id,
+          filename: archiveRow.archive_filename,
+          size: archiveRow.archive_size,
+          uncompressedSize: archiveRow.archive_uncompressed_size,
+          sha256: archiveRow.archive_sha256,
+          storageKey: archiveRow.archive_storage_key,
+          archivedAt: new Date(archiveRow.archive_archived_at * 1000).toISOString(),
+          legacyDeleteAfter: new Date(archiveRow.archive_legacy_delete_after * 1000).toISOString(),
+          legacyDeletedAt: archiveRow.archive_legacy_deleted_at === null
+            ? null
+            : new Date(archiveRow.archive_legacy_deleted_at * 1000).toISOString(),
         },
         build: {
-          ...toSummary(row, pullRequests.get(row.id) || []),
+          ...toSummary(archiveRow, pullRequests.get(archiveRow.id) || []),
           status: "ready" as const,
         },
-      }];
-    });
+      });
+    }
     return json({ items, nextCursor: listed.nextCursor }, {
       headers: { "Cache-Control": "public, max-age=15, s-maxage=30" },
     });
@@ -547,11 +672,20 @@ export async function handlePreviewRequest(request: Request, env: PreviewEnv): P
   }
   if (buildId && request.method === "GET") {
     if (!env.PREVIEWS) return invalid("Preview storage is not configured.", 503);
-    const build = await getBuild(env.PREVIEWS, buildId);
+    const build = await getBuild(env.PREVIEWS, buildId, false, url.origin);
     return build ? json(build, { headers: { "Cache-Control": "public, max-age=15, s-maxage=30" } }) : invalid("Preview build not found.", 404);
   }
   const assetMatch = url.pathname.match(/^\/api\/preview-assets\/(\d+)$/);
   if (assetMatch && request.method === "GET") return servePreviewAsset(env, Number(assetMatch[1]));
+  const archiveMatch = url.pathname.match(/^\/api\/preview-archives\/([^/]+)$/);
+  if (archiveMatch && request.method === "GET") {
+    try {
+      const archiveBuildId = decodeURIComponent(archiveMatch[1]);
+      if (/^[0-9]+:[0-9]+$/.test(archiveBuildId)) return servePreviewArchive(env, archiveBuildId);
+    } catch {
+      // The general API router returns 404 for malformed paths.
+    }
+  }
   if (url.pathname === "/api/storage/previews" && request.method === "GET") return listPreviewStorage(request, env);
   return null;
 }
@@ -565,10 +699,67 @@ export async function cleanupPreviews(env: PreviewEnv): Promise<void> {
   const ids = expired.results.map((row) => row.id);
   const placeholders = ids.map(() => "?").join(",");
   const assets = await env.PREVIEWS.prepare(
-    `SELECT r2_key FROM preview_assets WHERE build_id IN (${placeholders})`,
+    `SELECT r2_key FROM preview_assets WHERE build_id IN (${placeholders}) AND r2_key IS NOT NULL`,
+  ).bind(...ids).all<{ r2_key: string }>();
+  const archives = await env.PREVIEWS.prepare(
+    `SELECT r2_key FROM preview_archives WHERE build_id IN (${placeholders})`,
   ).bind(...ids).all<{ r2_key: string }>();
   if (assets.results.length) await env.RELEASE_ASSETS.delete(assets.results.map((row) => row.r2_key));
+  if (archives.results.length) await env.RELEASE_ASSETS.delete(archives.results.map((row) => row.r2_key));
   await env.PREVIEWS.prepare(`DELETE FROM preview_builds WHERE id IN (${placeholders})`).bind(...ids).run();
+}
+
+export async function reconcilePreviewArchives(env: PreviewEnv): Promise<void> {
+  if (!env.PREVIEWS || !env.PREVIEW_TASKS) return;
+  const now = Math.floor(Date.now() / 1000);
+  const missing = await env.PREVIEWS.prepare(`
+    SELECT b.id FROM preview_builds b
+    LEFT JOIN preview_archives ar ON ar.build_id = b.id
+    WHERE b.status = 'ready' AND b.expires_at > ? AND ar.build_id IS NULL
+    ORDER BY b.published_at
+    LIMIT 100
+  `).bind(now).all<{ id: string }>();
+  const due = await env.PREVIEWS.prepare(`
+    SELECT build_id AS id FROM preview_archives
+    WHERE legacy_deleted_at IS NULL AND legacy_delete_after <= ?
+    ORDER BY legacy_delete_after
+    LIMIT 100
+  `).bind(now).all<{ id: string }>();
+  const messages = [
+    ...missing.results.map((row) => ({
+      body: { schemaVersion: 1, type: "archive-preview", buildId: row.id } satisfies PreviewTask,
+    })),
+    ...due.results.map((row) => ({
+      body: { schemaVersion: 1, type: "cleanup-preview", buildId: row.id } satisfies PreviewTask,
+    })),
+  ];
+  for (let index = 0; index < messages.length; index += 100) {
+    await env.PREVIEW_TASKS.sendBatch(messages.slice(index, index + 100));
+  }
+}
+
+export async function cleanupArchivedPreview(env: PreviewEnv, buildId: string): Promise<void> {
+  if (!env.PREVIEWS || !env.RELEASE_ASSETS) throw new Error("Preview storage is not configured.");
+  if (!/^[0-9]+:[0-9]+$/.test(buildId)) throw new Error("Invalid preview build ID.");
+  const archive = await env.PREVIEWS.prepare(
+    "SELECT * FROM preview_archives WHERE build_id = ?",
+  ).bind(buildId).first<ArchiveRow>();
+  if (!archive || archive.legacy_deleted_at !== null) return;
+  const now = Math.floor(Date.now() / 1000);
+  if (archive.legacy_delete_after > now) {
+    await sendPreviewTask(env, { schemaVersion: 1, type: "cleanup-preview", buildId }, archive.legacy_delete_after - now);
+    return;
+  }
+  const assets = await env.PREVIEWS.prepare(
+    "SELECT r2_key FROM preview_assets WHERE build_id = ? AND r2_key IS NOT NULL",
+  ).bind(buildId).all<{ r2_key: string }>();
+  if (assets.results.length) await env.RELEASE_ASSETS.delete(assets.results.map((row) => row.r2_key));
+  await env.PREVIEWS.batch([
+    env.PREVIEWS.prepare("UPDATE preview_assets SET r2_key = NULL WHERE build_id = ?").bind(buildId),
+    env.PREVIEWS.prepare(
+      "UPDATE preview_archives SET legacy_deleted_at = ? WHERE build_id = ? AND legacy_deleted_at IS NULL",
+    ).bind(now, buildId),
+  ]);
 }
 
 export { previewStorageKey };

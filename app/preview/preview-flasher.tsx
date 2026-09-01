@@ -76,6 +76,7 @@ function buildAssets(build: PreviewBuild | null): PreviewFirmwareAsset[] {
     sha256: asset.sha256,
     variant: asset.variant,
     version: build.commitSha.slice(0, 12),
+    ...(build.storage.format === "tar.zst" ? { archive: build.storage } : {}),
   }));
 }
 

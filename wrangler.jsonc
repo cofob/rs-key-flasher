@@ -30,6 +30,46 @@
       "migrations_dir": "migrations"
     }
   ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "PREVIEW_TASKS",
+        "queue": "rs-key-preview-tasks"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "rs-key-preview-tasks",
+        "max_batch_size": 1,
+        "max_concurrency": 1,
+        "max_retries": 5,
+        "retry_delay": 60,
+        "dead_letter_queue": "rs-key-preview-tasks-dlq"
+      }
+    ]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PREVIEW_ARCHIVER",
+        "class_name": "PreviewArchiver"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["PreviewArchiver"]
+    }
+  ],
+  "containers": [
+    {
+      "class_name": "PreviewArchiver",
+      "image": "./Dockerfile.preview-archiver",
+      "instance_type": "basic",
+      "max_instances": 1
+    }
+  ],
   "routes": [
     { "pattern": "rskey.fob.wtf", "custom_domain": true }
   ],

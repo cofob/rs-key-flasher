@@ -13,9 +13,11 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "wasm:build": "./scripts/build-preview-wasm.sh",
     "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
+    "@cloudflare/containers": "0.3.7",
     "@cofob/design-system-css": "0.5.0",
     "@cofob/design-system-react": "0.5.0",
     "@noble/curves": "2.3.0",

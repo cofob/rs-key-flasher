@@ -28,12 +28,27 @@ npm run typecheck
 npm run build
 ```
 
+The generated Rust/WASM preview archive fallback is committed. A normal Node.js build does not need Rust. To regenerate it, install Rust 1.98.0, `wasm32-unknown-unknown`, and `wasm-bindgen-cli` 0.2.127, then run:
+
+```sh
+npm run wasm:build
+```
+
 Preview storage uses the `PREVIEWS` database binding and the existing `RELEASE_ASSETS` object-storage binding. Create the database, add its ID to `wrangler.jsonc`, and apply migrations:
 
 ```sh
 wrangler d1 create rs-key-flasher-previews
 wrangler d1 migrations apply rs-key-flasher-previews --remote
 ```
+
+Preview uploads send archive work to Cloudflare Queues. Create the task queue and its dead-letter queue before the first deploy:
+
+```sh
+wrangler queues create rs-key-preview-tasks-dlq
+wrangler queues create rs-key-preview-tasks
+```
+
+The Worker sends each new build to the queue at once. The existing daily trigger also finds old or missed builds and sends tasks to the same queue. A Cloudflare Container creates a deterministic `tar.zst` file with `zstd -T0 -15`. Individual UF2 objects stay available for 24 hours after the database switches to the archive. A later queue task removes them. The daily trigger still synchronizes release assets and removes expired previews.
 
 Asset download endpoints redirect to the public storage domain configured by `ASSET_PUBLIC_BASE_URL`. Apply the read-only CORS policy before deploying redirect support, then verify it:
 

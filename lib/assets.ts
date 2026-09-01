@@ -2,7 +2,12 @@ import type { FirmwareAsset } from "./releases";
 
 export function assetUrl(asset: FirmwareAsset, directGitHub = false): string {
   const base = import.meta.env.VITE_FLASHER_API_BASE || "";
-  if (asset.source === "preview") return `${base}/api/preview-assets/${asset.id}`;
+  if (asset.source === "preview") {
+    if (asset.archive) return asset.archive.downloadUrl.startsWith("/")
+      ? `${base}${asset.archive.downloadUrl}`
+      : asset.archive.downloadUrl;
+    return `${base}/api/preview-assets/${asset.id}`;
+  }
   if (asset.source === "local") throw new Error("A local firmware file has no download URL.");
   if (directGitHub) {
     return asset.downloadUrl
@@ -38,7 +43,8 @@ export async function downloadAsset(
     throw new Error(message?.error || `Firmware download failed with ${response.status}.`);
   }
 
-  const output = new Uint8Array(asset.size);
+  const downloadSize = asset.source === "preview" && asset.archive ? asset.archive.size : asset.size;
+  const output = new Uint8Array(downloadSize);
   const reader = response.body.getReader();
   let offset = 0;
   while (true) {
@@ -47,9 +53,19 @@ export async function downloadAsset(
     if (offset + value.byteLength > output.byteLength) throw new Error("Firmware is larger than release metadata.");
     output.set(value, offset);
     offset += value.byteLength;
-    onProgress(offset / asset.size);
+    onProgress((offset / downloadSize) * (asset.source === "preview" && asset.archive ? 0.8 : 1));
   }
-  if (offset !== asset.size) throw new Error("Firmware size does not match release metadata.");
+  if (offset !== downloadSize) throw new Error("Firmware size does not match release metadata.");
+
+  if (asset.source === "preview" && asset.archive) {
+    if (await sha256Hex(output) !== asset.archive.sha256) {
+      throw new Error("The preview archive SHA-256 does not match its metadata.");
+    }
+    const { extractPreviewArchive } = await import("./preview-archive");
+    return extractPreviewArchive(output, asset.archive, asset.name, asset.size, (value) => {
+      onProgress(0.8 + value * 0.2);
+    });
+  }
   return output;
 }
 

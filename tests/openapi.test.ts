@@ -7,6 +7,7 @@ const documentedPaths = [
   "/api/previews",
   "/api/previews/{buildId}",
   "/api/preview-assets/{assetId}",
+  "/api/preview-archives/{buildId}",
   "/api/storage/releases",
   "/api/storage/previews",
 ];

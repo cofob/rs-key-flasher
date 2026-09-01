@@ -2,7 +2,16 @@ import handler from "vinext/server/app-router-entry";
 import { fetchReleaseAttestations } from "../lib/release-attestation";
 import { verifyReleaseAttestationServer } from "../lib/release-attestation-server";
 import { parseAntiRollbackEpochMarker, type Release, type ReleaseAsset, type ReleaseManifest } from "../lib/releases";
-import { cleanupPreviews, handlePreviewRequest, type PreviewEnv } from "./previews";
+import { PreviewArchiver } from "./preview-archiver";
+import {
+  cleanupArchivedPreview,
+  cleanupPreviews,
+  enqueuePreviewCleanup,
+  handlePreviewRequest,
+  reconcilePreviewArchives,
+  type PreviewEnv,
+  type PreviewTask,
+} from "./previews";
 import { assetRedirect, listStorageObjects, parseStorageListQuery, publicAssetUrl } from "./storage";
 
 const REPOSITORY = "TheMaxMur/RS-Key";
@@ -20,6 +29,7 @@ interface Env extends PreviewEnv {
   RELEASE_ASSETS?: R2Bucket;
   ASSET_PUBLIC_BASE_URL?: string;
   GITHUB_TOKEN?: string;
+  PREVIEW_ARCHIVER?: DurableObjectNamespace<PreviewArchiver>;
 }
 
 interface WorkerContext {
@@ -83,7 +93,9 @@ function edgeHit(response: Response): Response {
 
 function cacheResponse(ctx: WorkerContext, key: Request, response: Response): void {
   const cache = defaultEdgeCache();
-  if (!cache || (!response.ok && response.status !== 307)) return;
+  const cacheControl = response.headers.get("Cache-Control") || "";
+  if (!cache || /(?:^|,)\s*(?:no-store|private)\b/i.test(cacheControl) ||
+      (!response.ok && response.status !== 307)) return;
   ctx.waitUntil(cache.put(key, response.clone()).catch(() => undefined));
 }
 
@@ -424,6 +436,7 @@ const worker = {
       url.pathname === "/api/previews" ||
       /^\/api\/previews\/[^/]+$/.test(url.pathname) ||
       /^\/api\/preview-assets\/\d+$/.test(url.pathname) ||
+      /^\/api\/preview-archives\/[^/]+$/.test(url.pathname) ||
       url.pathname === "/api/storage/previews"
     );
     if (cacheablePreviewPath) {
@@ -441,8 +454,29 @@ const worker = {
   async scheduled(_controller: unknown, env: Env, ctx: WorkerContext): Promise<void> {
     ctx.waitUntil(syncMirror(env));
     ctx.waitUntil(cleanupPreviews(env));
+    ctx.waitUntil(reconcilePreviewArchives(env));
+  },
+
+  async queue(batch: MessageBatch<PreviewTask>, env: Env): Promise<void> {
+    for (const message of batch.messages) {
+      const task = message.body;
+      if (task?.schemaVersion !== 1 || !/^[0-9]+:[0-9]+$/.test(task.buildId) ||
+          (task.type !== "archive-preview" && task.type !== "cleanup-preview")) {
+        message.ack();
+        continue;
+      }
+      if (task.type === "cleanup-preview") {
+        await cleanupArchivedPreview(env, task.buildId);
+        message.ack();
+        continue;
+      }
+      if (!env.PREVIEW_ARCHIVER) throw new Error("The preview archive container is not configured.");
+      const result = await env.PREVIEW_ARCHIVER.getByName("preview-archiver").archive(task.buildId);
+      if (result !== "skipped") await enqueuePreviewCleanup(env, task.buildId);
+      message.ack();
+    }
   },
 };
 
-export { getReleases, releaseStorageKey, syncMirror };
+export { getReleases, PreviewArchiver, releaseStorageKey, syncMirror };
 export default worker;

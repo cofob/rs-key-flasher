@@ -60,6 +60,22 @@ export interface PreviewAsset extends PreviewAssetMetadata {
   buildId: string;
 }
 
+export interface PreviewIndividualStorage {
+  format: "individual";
+}
+
+export interface PreviewArchiveStorage {
+  format: "tar.zst";
+  filename: string;
+  size: number;
+  uncompressedSize: number;
+  sha256: string;
+  archivedAt: string;
+  downloadUrl: string;
+}
+
+export type PreviewStorage = PreviewIndividualStorage | PreviewArchiveStorage;
+
 export interface PreviewBuildSummary {
   id: string;
   runId: number;
@@ -80,6 +96,7 @@ export interface PreviewBuildSummary {
 
 export interface PreviewBuild extends PreviewBuildSummary {
   assets: PreviewAsset[];
+  storage: PreviewStorage;
 }
 
 export interface PreviewListResponse {

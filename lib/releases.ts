@@ -1,4 +1,5 @@
 import type { ReleaseAttestation } from "./release-attestation";
+import type { PreviewArchiveStorage } from "./previews";
 
 export interface ReleaseAsset {
   id: number;
@@ -71,6 +72,7 @@ export interface PreviewFirmwareAsset extends FirmwareAssetBase {
   source: "preview";
   buildId: string;
   commitSha: string;
+  archive?: PreviewArchiveStorage;
 }
 
 export interface LocalFirmwareAsset extends FirmwareAssetBase {

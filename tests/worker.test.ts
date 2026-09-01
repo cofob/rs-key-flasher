@@ -397,3 +397,43 @@ describe("Worker cache", () => {
     expect(objects.size).toBe(2);
   });
 });
+
+describe("Preview task Queue", () => {
+  it("archives one build and schedules cleanup after 24 hours", async () => {
+    const archive = vi.fn(async () => "created" as const);
+    const send = vi.fn();
+    const ack = vi.fn();
+
+    await worker.queue({
+      messages: [{
+        body: { schemaVersion: 1, type: "archive-preview", buildId: "123:2" },
+        ack,
+      }],
+    } as never, {
+      PREVIEW_ARCHIVER: { getByName: () => ({ archive }) },
+      PREVIEW_TASKS: { send },
+    } as never);
+
+    expect(archive).toHaveBeenCalledWith("123:2");
+    expect(send).toHaveBeenCalledWith(
+      { schemaVersion: 1, type: "cleanup-preview", buildId: "123:2" },
+      { delaySeconds: 86_400 },
+    );
+    expect(ack).toHaveBeenCalledOnce();
+  });
+
+  it("leaves a failed archive task for Queue retry handling", async () => {
+    const ack = vi.fn();
+    await expect(worker.queue({
+      messages: [{
+        body: { schemaVersion: 1, type: "archive-preview", buildId: "123:2" },
+        ack,
+      }],
+    } as never, {
+      PREVIEW_ARCHIVER: {
+        getByName: () => ({ archive: async () => { throw new Error("archive failed"); } }),
+      },
+    } as never)).rejects.toThrow("archive failed");
+    expect(ack).not.toHaveBeenCalled();
+  });
+});
