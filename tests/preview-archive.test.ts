@@ -1,8 +1,9 @@
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { extractPreviewArchive, extractPreviewTarMember } from "../lib/preview-archive";
 import { PREVIEW_VARIANTS, previewAssetFilename } from "../lib/previews";
-import initializeWasm from "../lib/wasm/generated/preview_archive.js";
+
+afterEach(() => vi.restoreAllMocks());
 
 const encoder = new TextEncoder();
 
@@ -136,7 +137,9 @@ describe("preview TAR extraction", () => {
       "../lib/wasm/generated/preview_archive_bg.wasm",
       import.meta.url,
     ));
-    await initializeWasm({ module_or_path: await WebAssembly.compile(moduleBytes) });
+    const fetchWasm = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(moduleBytes, {
+      headers: { "Content-Type": "application/wasm" },
+    }));
     const compressed = Uint8Array.from(Buffer.from(
       "KLUv/QRgPQoAsk0oGoClddFAmyiM3q6GsH16GdG6QmlKmasUxXcH3MYg1qMhKTjcg99IPEnQiMOthKs9+ImTIrOt6ZFG7Cl4gXzT7YVFdIINvYuGVeRgRQfRKrPDJXs+eEbwRA1SH/M5/INBTs7bQA6MsU9r2Og5Rm9Cp9xTnsNzp3gXpTZLAElCzC94Ujhzm6JansOPRQHKnqS7WphbVbUYIgYoozfZ88R4jQg8qMGVglIgEmoKLQdAAxHlbjEROAQJAUIYIfz/HUgsUkjgc/2HMbZa7gQg2x1AwvWcAJDtk1B2NQFhAGfpDqC5foAqbDWax/+Zba18hutr//ufkq23C7jtvAkcB+SwfWPQJ5DzHaCdwipAlBsh6gHicrflQy4QMSjA0dvP2VtgYjsA9BPAdZ9nbgN6thEomgDVBujm0T1AtexY6Sw4zHZ6zlcB1m1PJA==",
       "base64",
@@ -153,5 +156,9 @@ describe("preview TAR extraction", () => {
     }, "firmware-default.uf2", 512, undefined, true);
 
     expect(result).toEqual(new Uint8Array(512));
+    expect(fetchWasm).toHaveBeenCalledOnce();
+    const wasmUrl = fetchWasm.mock.calls[0][0];
+    expect(typeof wasmUrl).toBe("string");
+    expect(wasmUrl).toMatch(/^\/(?!\/).*\.wasm(?:\?.*)?$/);
   });
 });

@@ -1,4 +1,5 @@
 import { PREVIEW_VARIANTS, previewAssetFilename, type PreviewArchiveStorage } from "./previews";
+import previewArchiveWasmUrl from "./wasm/generated/preview_archive_bg.wasm?url";
 
 const TAR_BLOCK_SIZE = 512;
 const MAX_ARCHIVE_OUTPUT_SIZE = 100 * 1024 * 1024;
@@ -165,7 +166,7 @@ export async function extractPreviewArchive(
   }
 
   const wasm = await import("./wasm/generated/preview_archive.js");
-  await wasm.default();
+  await wasm.default({ module_or_path: previewArchiveWasmUrl });
   const output = wasm.extract_preview_member(
     bytes,
     memberName,
