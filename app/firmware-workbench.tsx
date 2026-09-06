@@ -518,7 +518,9 @@ export function FirmwareWorkbench({
                               onChange={(event) => setManualVariant(event.target.value)}
                             >
                               {assets.map((asset) => (
-                                <option key={`${asset.source}-${asset.id}`} value={asset.variant}>{variantLabel(asset.variant)}</option>
+                                <option key={`${asset.source}-${asset.id}`} value={asset.variant}>
+                                  {variantLabel(asset.variant)}{asset.source === "preview" ? ` · ${asset.name}` : ""}
+                                </option>
                               ))}
                             </Select>
                           )}

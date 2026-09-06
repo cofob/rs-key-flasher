@@ -203,7 +203,9 @@ const GEOMETRY_VARIANTS = new Set(["2mb", "16mb", "display"]);
 export function firmwareProfiles(assets: FirmwareAsset[]): string[] {
   return assets
     .map((asset) => asset.variant)
-    .filter((variant, index, variants) => !GEOMETRY_VARIANTS.has(variant) && variants.indexOf(variant) === index);
+    .filter((variant, index, variants) =>
+      !GEOMETRY_VARIANTS.has(variant) && !variant.startsWith("board-") && variants.indexOf(variant) === index,
+    );
 }
 
 const VARIANT_LABELS: Record<string, string> = {

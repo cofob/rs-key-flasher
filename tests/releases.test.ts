@@ -73,7 +73,7 @@ describe("release asset parsing", () => {
   });
 
   it("lists policy profiles without geometry-only variants", () => {
-    const assets = ["default", "display", "16mb", "fips", "fips-pqc"].map((variant, index) => ({
+    const assets = ["default", "display", "16mb", "fips", "fips-pqc", "board-waveshare-one", "board-waveshare-touch-lcd"].map((variant, index) => ({
       ...asset,
       source: "release" as const,
       id: index,
