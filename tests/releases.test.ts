@@ -72,6 +72,17 @@ describe("release asset parsing", () => {
     expect(recommendVariant(false, "4", "fips-pqc")).toBe("fips-pqc");
   });
 
+  it("prefers the display board image when the selected build provides it", () => {
+    expect(recommendVariant(true, "16", "default", ["display", "board-waveshare-touch-lcd"]))
+      .toBe("board-waveshare-touch-lcd");
+    expect(recommendVariant(true, "16", "default", ["board-waveshare-touch-lcd"]))
+      .toBe("board-waveshare-touch-lcd");
+    expect(recommendVariant(true, "16", "default", ["default", "display"]))
+      .toBe("display");
+    expect(recommendVariant(false, "16", "default", ["16mb", "board-waveshare-touch-lcd"]))
+      .toBe("16mb");
+  });
+
   it("lists policy profiles without geometry-only variants", () => {
     const assets = ["default", "display", "16mb", "fips", "fips-pqc", "board-waveshare-one", "board-waveshare-touch-lcd"].map((variant, index) => ({
       ...asset,

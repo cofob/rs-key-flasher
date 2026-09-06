@@ -190,9 +190,16 @@ export function findOfficialAssetBySha256(releases: Release[], sha256: string): 
   return undefined;
 }
 
-export function recommendVariant(hasDisplay: boolean, flashSize: string, profile = "default"): string {
+export function recommendVariant(
+  hasDisplay: boolean,
+  flashSize: string,
+  profile = "default",
+  availableVariants: readonly string[] = [],
+): string {
   if (profile !== "default") return profile;
-  if (hasDisplay) return "display";
+  if (hasDisplay) {
+    return availableVariants.includes("board-waveshare-touch-lcd") ? "board-waveshare-touch-lcd" : "display";
+  }
   if (flashSize === "2") return "2mb";
   if (flashSize === "16") return "16mb";
   return "default";

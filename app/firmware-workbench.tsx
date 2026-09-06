@@ -195,7 +195,7 @@ export function FirmwareWorkbench({
 
   const profiles = useMemo(() => firmwareProfiles(assets), [assets]);
   const effectiveProfile = profiles.includes(profile) ? profile : "default";
-  const easyVariant = recommendVariant(display, flashSize, effectiveProfile);
+  const easyVariant = recommendVariant(display, flashSize, effectiveProfile, assets.map((asset) => asset.variant));
   const effectiveManualVariant = assets.some((asset) => asset.variant === manualVariant)
     ? manualVariant
     : assets.find((asset) => asset.variant === "default")?.variant || assets[0]?.variant || "";
