@@ -45,6 +45,10 @@ export class PreviewArchiver extends Container<PreviewArchiverEnv> {
   enableInternet = false;
   entrypoint = ["sleep", "infinity"];
 
+  override async onActivityExpired(): Promise<void> {
+    await this.destroy();
+  }
+
   async archive(buildId: string): Promise<"created" | "exists" | "skipped"> {
     if (!safeBuildId(buildId)) throw new Error("Invalid preview build ID.");
 
@@ -124,23 +128,27 @@ export class PreviewArchiver extends Container<PreviewArchiverEnv> {
       const stream = await container.exec(["cat", archivePath], { stdout: "pipe", stderr: "pipe" });
       this.renewActivityTimeout();
       if (!stream.stdout) throw new Error("The archive stream is not available.");
-      await this.env.RELEASE_ASSETS.put(r2Key, stream.stdout, {
-        sha256: Uint8Array.from(
-          archiveSha256.match(/../g) || [],
-          (value) => Number.parseInt(value, 16),
-        ).buffer,
-        httpMetadata: {
-          contentType: "application/zstd",
-          contentDisposition: `attachment; filename="${filename}"`,
-          cacheControl: "public, max-age=31536000, immutable",
-        },
-        customMetadata: {
-          buildId,
-          filename,
-          sha256: archiveSha256,
-          format: "tar.zst",
-        },
-      });
+      const upload = new FixedLengthStream(archiveSize);
+      await Promise.all([
+        stream.stdout.pipeTo(upload.writable),
+        this.env.RELEASE_ASSETS.put(r2Key, upload.readable, {
+          sha256: Uint8Array.from(
+            archiveSha256.match(/../g) || [],
+            (value) => Number.parseInt(value, 16),
+          ).buffer,
+          httpMetadata: {
+            contentType: "application/zstd",
+            contentDisposition: `attachment; filename="${filename}"`,
+            cacheControl: "public, max-age=31536000, immutable",
+          },
+          customMetadata: {
+            buildId,
+            filename,
+            sha256: archiveSha256,
+            format: "tar.zst",
+          },
+        }),
+      ]);
       if (await stream.exitCode !== 0) {
         await this.env.RELEASE_ASSETS.delete(r2Key);
         throw new Error("Could not read the completed archive.");
@@ -168,7 +176,12 @@ export class PreviewArchiver extends Container<PreviewArchiverEnv> {
       }
       return "created";
     } finally {
-      await processText(await container.exec(["rm", "-rf", jobDirectory])).catch(() => undefined);
+      try {
+        await processText(await container.exec(["rm", "-rf", jobDirectory]));
+      } catch {
+        // The container is destroyed below, including its ephemeral disk.
+      }
+      await this.destroy();
     }
   }
 }

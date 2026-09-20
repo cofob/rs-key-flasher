@@ -37,4 +37,10 @@ describe("preview archive Cloudflare configuration", () => {
     expect(source).toContain("zstd -T0 -15 -o archive.tar.zst");
     expect(source).not.toContain("--long");
   });
+
+  it("destroys the Container after each archive job and idle timeout", async () => {
+    const source = await readFile(new URL("../worker/preview-archiver.ts", import.meta.url), "utf8");
+    expect(source).toContain('sleepAfter = "30s"');
+    expect(source.match(/await this\.destroy\(\)/g)).toHaveLength(2);
+  });
 });
