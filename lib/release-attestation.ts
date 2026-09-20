@@ -182,33 +182,54 @@ export async function fetchReleaseAttestation(
   return fetchAttestationForDigest(release, refDigestFromSha(ref.object?.sha), headers, fetcher);
 }
 
+// Scope this loader to one catalog snapshot. Share tag and attestation requests.
+export function createReleaseAttestationLoader(
+  headers?: HeadersInit,
+  fetcher: typeof fetch = fetch,
+): (release: Release) => Promise<ReleaseAttestation> {
+  let tagDigests: Promise<Map<string, string>> | undefined;
+  const pending = new Map<Release, Promise<ReleaseAttestation>>();
+  async function loadTagDigests(): Promise<Map<string, string>> {
+    const response = await fetcher(
+      `https://api.github.com/repos/${RS_KEY_REPOSITORY}/git/matching-refs/tags/`,
+      { headers },
+    );
+    if (!response.ok) throw new Error(`GitHub tag list lookup returned ${response.status}.`);
+    const refs = await response.json() as GitHubMatchingRefResponse[];
+    if (!Array.isArray(refs)) throw new Error("GitHub returned an invalid tag list.");
+    return new Map(refs.flatMap((ref): Array<[string, string]> => {
+      if (!ref.ref?.startsWith("refs/tags/")) return [];
+      return [[ref.ref.slice("refs/tags/".length), refDigestFromSha(ref.object?.sha)]];
+    }));
+  }
+  return (release) => {
+    let result = pending.get(release);
+    if (!result) {
+      tagDigests ??= loadTagDigests();
+      result = tagDigests.then((digests) => {
+        const digest = digests.get(release.tag);
+        if (!digest) throw new Error(`GitHub returned no tag digest for ${release.tag}.`);
+        return fetchAttestationForDigest(release, digest, headers, fetcher);
+      });
+      pending.set(release, result);
+    }
+    return result;
+  };
+}
+
 export async function fetchReleaseAttestations(
   releases: Release[],
   headers?: HeadersInit,
   fetcher: typeof fetch = fetch,
 ): Promise<ReleaseAttestation[]> {
-  if (!releases.length) return [];
-  const response = await fetcher(
-    `https://api.github.com/repos/${RS_KEY_REPOSITORY}/git/matching-refs/tags/`,
-    { headers },
-  );
-  if (!response.ok) throw new Error(`GitHub tag list lookup returned ${response.status}.`);
-  const refs = await response.json() as GitHubMatchingRefResponse[];
-  if (!Array.isArray(refs)) throw new Error("GitHub returned an invalid tag list.");
-  const tagDigests = new Map(refs.flatMap((ref): Array<[string, string]> => {
-    if (!ref.ref?.startsWith("refs/tags/")) return [];
-    return [[ref.ref.slice("refs/tags/".length), refDigestFromSha(ref.object?.sha)]];
-  }));
-
+  const load = createReleaseAttestationLoader(headers, fetcher);
   const results = new Array<ReleaseAttestation>(releases.length);
   let nextIndex = 0;
   async function loadNext(): Promise<void> {
     while (nextIndex < releases.length) {
       const index = nextIndex++;
       const release = releases[index];
-      const refDigest = tagDigests.get(release.tag);
-      if (!refDigest) throw new Error(`GitHub returned no tag digest for ${release.tag}.`);
-      results[index] = await fetchAttestationForDigest(release, refDigest, headers, fetcher);
+      results[index] = await load(release);
     }
   }
   await Promise.all(Array.from({ length: Math.min(4, releases.length) }, () => loadNext()));

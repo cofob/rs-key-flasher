@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Link, Select, Stack, Switch, Text } from "@cofob/design-system-react/static";
 import { ShieldCheck } from "lucide-react";
-import { fetchReleaseAttestations, RS_KEY_REPOSITORY_URL } from "../lib/release-attestation";
+import { createReleaseAttestationLoader, RS_KEY_REPOSITORY_URL } from "../lib/release-attestation";
 import {
   firmwareAssets,
   releaseManifestFromGitHub,
@@ -104,6 +104,9 @@ export function Flasher() {
   const [directFallback, setDirectFallback] = useState(false);
   const [attestationChecks, setAttestationChecks] = useState<Record<string, AttestationCheck>>({});
 
+  const verificationTasks = useRef(new Map<Release, Promise<AttestationCheck>>());
+  const [loadAttestation] = useState(() => createReleaseAttestationLoader({ Accept: "application/vnd.github+json" }));
+
   useEffect(() => {
     const useDirectGitHub = localStorage.getItem(API_SOURCE_KEY) === "github";
     const directHeaders = { Accept: "application/vnd.github+json" };
@@ -118,14 +121,7 @@ export function Flasher() {
       }
       return direct ? releaseManifestFromGitHub(body) : body as ReleaseManifest;
     };
-    const loadDirect = async (): Promise<ReleaseManifest> => {
-      const data = await fetchManifest(GITHUB_RELEASES_URL, true);
-      const attestations = await fetchReleaseAttestations(data.releases, directHeaders);
-      return {
-        ...data,
-        releases: data.releases.map((release, index) => ({ ...release, attestation: attestations[index] })),
-      };
-    };
+    const loadDirect = () => fetchManifest(GITHUB_RELEASES_URL, true);
     resolveReleaseManifest(
       useDirectGitHub,
       () => fetchManifest(`${import.meta.env.VITE_FLASHER_API_BASE || ""}/api/releases`, false),
@@ -142,44 +138,46 @@ export function Flasher() {
       .catch((reason) => setReleaseError(reason instanceof Error ? reason.message : "Could not load releases."));
   }, []);
 
-  useEffect(() => {
-    if (!manifest) return;
-    let cancelled = false;
-    void (async () => {
-      let verifyReleaseAttestationClient: typeof import("../lib/release-attestation-client").verifyReleaseAttestationClient;
-      try {
-        ({ verifyReleaseAttestationClient } = await import("../lib/release-attestation-client"));
-      } catch (reason) {
-        if (!cancelled) {
-          const error = reason instanceof Error ? reason.message : "The browser verifier could not start.";
-          setAttestationChecks(Object.fromEntries(
-            manifest.releases.map((release) => [release.tag, { status: "failed", error } satisfies AttestationCheck]),
-          ));
-        }
-        return;
-      }
-      const checks = await Promise.all(manifest.releases.map(async (release): Promise<[string, AttestationCheck]> => {
-        try {
-          if (!release.attestation) throw new Error("The release has no GitHub keyless attestation.");
-          await verifyReleaseAttestationClient(release, release.attestation);
-          return [release.tag, { status: "verified" }];
-        } catch (reason) {
-          return [release.tag, {
-            status: "failed",
-            error: reason instanceof Error ? reason.message : "The release attestation is invalid.",
-          }];
-        }
-      }));
-      if (!cancelled) setAttestationChecks(Object.fromEntries(checks));
-    })();
-    return () => { cancelled = true; };
-  }, [manifest]);
-
   const visibleReleases = useMemo(
     () => manifest?.releases.filter((release) => showPrereleases || !release.prerelease) || [],
     [manifest, showPrereleases],
   );
   const release = visibleReleases.find((candidate) => candidate.tag === releaseTag) || visibleReleases[0];
+
+  useEffect(() => {
+    if (!manifest) return;
+    let cancelled = false;
+    const targets = directGitHub ? release ? [release] : [] : manifest.releases;
+    let nextIndex = 0;
+    async function checkNext(): Promise<void> {
+      while (!cancelled && nextIndex < targets.length) {
+        const item = targets[nextIndex++];
+        let task = verificationTasks.current.get(item);
+        if (!task) {
+          task = (async (): Promise<AttestationCheck> => {
+            try {
+              const attestation = directGitHub ? await loadAttestation(item) : item.attestation;
+              if (!attestation) throw new Error("The release has no GitHub keyless attestation.");
+              const { verifyReleaseAttestationClient } = await import("../lib/release-attestation-client");
+              await verifyReleaseAttestationClient(item, attestation);
+              return { status: "verified" };
+            } catch (reason) {
+              return {
+                status: "failed",
+                error: reason instanceof Error ? reason.message : "The release attestation is invalid.",
+              };
+            }
+          })();
+          verificationTasks.current.set(item, task);
+        }
+        const check = await task;
+        if (!cancelled) setAttestationChecks((checks) => ({ ...checks, [item.tag]: check }));
+      }
+    }
+    void Promise.all(Array.from({ length: Math.min(4, targets.length) }, () => checkNext()));
+    return () => { cancelled = true; };
+  }, [manifest, release, directGitHub, loadAttestation]);
+
   const assets = useMemo(() => release ? firmwareAssets(release) : [], [release]);
   const releaseAttestation = release
     ? attestationChecks[release.tag] || { status: "pending" as const }
@@ -187,10 +185,10 @@ export function Flasher() {
   const verifiedOfficialReleases = manifest?.releases.filter((item) =>
     attestationChecks[item.tag]?.status === "verified",
   ) || [];
-  const officialComparisonReady = Boolean(manifest?.releases.length && manifest.releases.every((item) =>
+  const officialComparisonReady = Boolean(!directGitHub && manifest?.releases.length && manifest.releases.every((item) =>
     attestationChecks[item.tag]?.status === "verified",
   ));
-  const officialComparisonFailed = Boolean(manifest?.releases.some((item) =>
+  const officialComparisonFailed = Boolean(!directGitHub && manifest?.releases.some((item) =>
     attestationChecks[item.tag]?.status === "failed",
   ));
 

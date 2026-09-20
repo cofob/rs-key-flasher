@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { verifyReleaseAttestationClient } from "../lib/release-attestation-client";
 import {
   assertReleaseAttestationClaims,
+  createReleaseAttestationLoader,
   fetchReleaseAttestation,
   fetchReleaseAttestations,
 } from "../lib/release-attestation";
@@ -61,6 +62,34 @@ describe("GitHub keyless release attestation", () => {
 
     await expect(fetchReleaseAttestation(release, undefined, fetcher)).resolves.toEqual(attestation);
     expect(String(fetcher.mock.calls[1][0])).toContain(`/attestations/${attestation.refDigest}`);
+  });
+
+  it("loads attestations on demand and shares concurrent and completed requests", async () => {
+    const { release, attestation } = testData();
+    const other = { ...release, tag: "unselected-release" };
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).includes("/git/matching-refs/tags/")) {
+        return Response.json([release, other].map((item) => ({
+          ref: `refs/tags/${item.tag}`,
+          object: { sha: attestation.refDigest.slice("sha1:".length) },
+        })));
+      }
+      return Response.json({ attestations: [{
+        initiator: "github",
+        repository_id: attestation.repositoryId,
+        bundle: attestation.bundle,
+      }] });
+    });
+    const load = createReleaseAttestationLoader(undefined, fetcher);
+    expect(fetcher).not.toHaveBeenCalled();
+    await expect(Promise.all([load(release), load(release)])).resolves.toEqual([attestation, attestation]);
+    await expect(load(release)).resolves.toEqual(attestation);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    // A later selection reuses the tag list but must pass its own claims check.
+    await expect(load(other)).rejects.toThrow(/does not describe/);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    await expect(load(other)).rejects.toThrow(/does not describe/);
+    expect(fetcher).toHaveBeenCalledTimes(3);
   });
 
   it("loads tag refs once when it loads a release list", async () => {
