@@ -14,9 +14,9 @@ import {
   Text,
   Textarea,
   TextField,
-} from "@cofob/design-system-react/static";
+} from "@cofob2/design-system-react/static";
 import { Copy, Download, KeyRound, ShieldCheck, Usb } from "lucide-react";
-import { Dialog, useToast } from "@cofob/design-system-react/client";
+import { Dialog, useToast } from "@cofob2/design-system-react/client";
 import { downloadVerifiedAsset, sha256Hex } from "../lib/assets";
 import {
   parseRskStatusJson,

@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { headers } from "next/headers";
-import { ThemeScript } from "@cofob/design-system-react/static";
-import "@cofob/design-system-css/index.css";
+import { ThemeScript } from "@cofob2/design-system-react/static";
+import "@cofob2/design-system-css/index.css";
 import "./globals.css";
 import { AppProviders } from "./providers";
 

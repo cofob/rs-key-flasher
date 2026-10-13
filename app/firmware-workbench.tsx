@@ -6,7 +6,7 @@ import {
   type ThemeController,
   type ThemePreference,
   type ThemeState,
-} from "@cofob/design-system-css";
+} from "@cofob2/design-system-css";
 import {
   Alert,
   AppShell,
@@ -25,7 +25,7 @@ import {
   Switch,
   Text,
   TextField,
-} from "@cofob/design-system-react/static";
+} from "@cofob2/design-system-react/static";
 import { Check, CheckCircle2, Cpu, Download as DownloadIcon, File, ShieldCheck, Usb } from "lucide-react";
 import { downloadVerifiedAsset, sha256Hex } from "../lib/assets";
 import { readSecureBootOtpState } from "../lib/otp";
