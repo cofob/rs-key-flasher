@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Link, Select, Stack, Switch, Text } from "@cofob/design-system-react/static";
+import { Alert, Link, Select, Stack, Switch, Text } from "@cofob2/design-system-react/static";
 import { ShieldCheck } from "lucide-react";
 import { createReleaseAttestationLoader, RS_KEY_REPOSITORY_URL } from "../lib/release-attestation";
 import {

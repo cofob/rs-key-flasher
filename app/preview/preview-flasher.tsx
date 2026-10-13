@@ -11,7 +11,7 @@ import {
   Stack,
   Text,
   TextField,
-} from "@cofob/design-system-react/static";
+} from "@cofob2/design-system-react/static";
 import { Search } from "lucide-react";
 import type {
   PreviewBuild,
